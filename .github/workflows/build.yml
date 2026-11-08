@@ -1,0 +1,133 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x86_64
+
+      - name: Build
+        run: cargo build --release --locked -p oxidecode-cli --bin oxidecode
+
+      - name: Test
+        run: cargo test --release --locked --workspace
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxidecode-linux-x86_64
+          path: target/release/oxidecode
+          if-no-files-found: error
+
+  termux-aarch64:
+    name: Termux / Android arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-aarch64
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Build
+        run: cargo ndk -t arm64-v8a build --release --locked -p oxidecode-cli --bin oxidecode
+
+      - name: Strip
+        run: |
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            target/aarch64-linux-android/release/oxidecode || true
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxidecode-termux-aarch64
+          path: target/aarch64-linux-android/release/oxidecode
+          if-no-files-found: error
+
+  linux-aarch64-musl:
+    name: Linux arm64 (static musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Build static binary
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: aarch64-unknown-linux-musl
+          args: --release --locked -p oxidecode-cli --bin oxidecode
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxidecode-linux-aarch64-musl
+          path: target/aarch64-unknown-linux-musl/release/oxidecode
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-x86_64, termux-aarch64, linux-aarch64-musl]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Rename binaries
+        run: |
+          mkdir -p out
+          cp dist/oxidecode-linux-x86_64/oxidecode out/oxidecode-linux-x86_64
+          cp dist/oxidecode-termux-aarch64/oxidecode out/oxidecode-termux-aarch64
+          cp dist/oxidecode-linux-aarch64-musl/oxidecode out/oxidecode-linux-aarch64-musl
+          chmod +x out/*
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

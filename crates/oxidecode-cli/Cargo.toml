@@ -1,0 +1,30 @@
+[package]
+name = "oxidecode-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OxideCode command line interface"
+
+[lib]
+name = "oxidecode_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "oxidecode"
+path = "src/main.rs"
+
+[dependencies]
+oxidecode-core = { path = "../oxidecode-core" }
+oxidecode-provider = { path = "../oxidecode-provider" }
+oxidecode-server = { path = "../oxidecode-server" }
+oxidecode-tools = { path = "../oxidecode-tools" }
+oxidecode-tui = { path = "../oxidecode-tui" }
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

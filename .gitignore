@@ -1,0 +1,13 @@
+# Rust build output
+/target
+**/target
+
+# OxideCode runtime data (never commit)
+.oxidecode/
+*.log
+
+# Editors and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

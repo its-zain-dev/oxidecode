@@ -1,0 +1,12 @@
+[package]
+name = "oxidecode-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native C primitives for OxideCode: PTY, terminal sizing, fast search"
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"
