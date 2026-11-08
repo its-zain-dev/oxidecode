@@ -35,31 +35,59 @@ pub fn stream(request: ProviderRequest) -> ProviderStream {
         ));
         sleep(Duration::from_millis(15)).await;
 
-        if let Some(rest) = prompt.trim().strip_prefix(":tool ") {
-            let mut parts = rest.splitn(2, ' ');
-            let name = parts.next().unwrap_or("").trim().to_string();
-            let input = parts.next().unwrap_or("{}").trim();
-            let parsed = serde_json::from_str::<Value>(input).unwrap_or_else(|_| json!({}));
-            let id = format!("call_{}", short_hash(&prompt));
-            yield Ok(ProviderEvent::ToolInputStarted {
-                id: id.clone(),
-                name: name.clone(),
-            });
-            let arguments = parsed.to_string();
-            for chunk in split_chunks(&arguments, 24) {
-                yield Ok(ProviderEvent::ToolInputDelta {
-                    id: id.clone(),
-                    delta: chunk,
-                });
-                sleep(Duration::from_millis(5)).await;
+        let last_role = request
+            .messages
+            .last()
+            .map(|message| message.role.as_str())
+            .unwrap_or("");
+
+        // A tool result comes back as its own message. Answer it instead of
+        // replaying the original `:tool` command, otherwise the agent loop
+        // would call the same tool forever.
+        if last_role == "tool" {
+            let answer = "Tool execution finished.".to_string();
+            for chunk in split_chunks(&answer, 48) {
+                yield Ok(ProviderEvent::TextDelta(chunk));
+                sleep(Duration::from_millis(8)).await;
             }
-            yield Ok(ProviderEvent::ToolInputEnded {
-                id,
-                name,
-                input: parsed,
+            yield Ok(ProviderEvent::Usage {
+                input: 1,
+                output: 5,
+                reasoning: 0,
+                cache_read: 0,
+                cache_write: 0,
             });
-            yield Ok(ProviderEvent::Finish { reason: "tool-calls".into() });
+            yield Ok(ProviderEvent::Finish { reason: "stop".into() });
             return;
+        }
+
+        if last_role == "user" {
+            if let Some(rest) = prompt.trim().strip_prefix(":tool ") {
+                let mut parts = rest.splitn(2, ' ');
+                let name = parts.next().unwrap_or("").trim().to_string();
+                let input = parts.next().unwrap_or("{}").trim();
+                let parsed = serde_json::from_str::<Value>(input).unwrap_or_else(|_| json!({}));
+                let id = format!("call_{}", short_hash(&prompt));
+                yield Ok(ProviderEvent::ToolInputStarted {
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+                let arguments = parsed.to_string();
+                for chunk in split_chunks(&arguments, 24) {
+                    yield Ok(ProviderEvent::ToolInputDelta {
+                        id: id.clone(),
+                        delta: chunk,
+                    });
+                    sleep(Duration::from_millis(5)).await;
+                }
+                yield Ok(ProviderEvent::ToolInputEnded {
+                    id,
+                    name,
+                    input: parsed,
+                });
+                yield Ok(ProviderEvent::Finish { reason: "tool-calls".into() });
+                return;
+            }
         }
 
         let slow = prompt.trim().strip_prefix(":slow ").unwrap_or(&prompt).to_string();
