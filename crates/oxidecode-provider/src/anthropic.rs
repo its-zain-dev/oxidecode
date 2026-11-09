@@ -1,9 +1,23 @@
 use crate::catalog::ResolvedModel;
-use crate::client::{base_headers, SseDecoder};
+use crate::client::{base_headers, format_http_error, SseDecoder};
 use crate::types::{ProviderEvent, ProviderRequest, ProviderStream};
 use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+
+pub fn resolve_endpoint_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/messages") {
+        base.to_string()
+    } else if base.ends_with("opencode.ai/inference") || base.ends_with("opencode.ai/inference/go")
+    {
+        format!("{base}/anthropic/v1/messages")
+    } else if base.ends_with("/anthropic") {
+        format!("{base}/v1/messages")
+    } else {
+        format!("{base}/messages")
+    }
+}
 
 /// Anthropic Messages API streaming client.
 ///
@@ -16,7 +30,7 @@ pub async fn stream(
     model: &ResolvedModel,
     request: ProviderRequest,
 ) -> Result<ProviderStream> {
-    let url = format!("{}/messages", model.base_url.trim_end_matches('/'));
+    let url = resolve_endpoint_url(&model.base_url);
     let mut body = json!({
         "model": request.model_id,
         "max_tokens": request.max_tokens.unwrap_or(8192),
@@ -50,24 +64,26 @@ pub async fn stream(
         .header("anthropic-version", "2023-06-01")
         .json(&body);
     if let Some(key) = &model.api_key {
-        builder = builder.header("x-api-key", key);
+        if !key.is_empty() {
+            builder = builder.header("x-api-key", key);
+            if model.provider_id == "opencode"
+                || model.provider_id == "opencode-zen"
+                || model.provider_id == "opencode-go"
+                || model.base_url.contains("opencode.ai")
+            {
+                builder = builder.bearer_auth(key);
+            }
+        }
     }
     let builder = base_headers(builder, model);
     let response = builder.send().await?;
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        let detail = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or(text);
-        bail!("anthropic returned HTTP {}: {}", status.as_u16(), truncate(&detail, 1200));
+        bail!(
+            "{}",
+            format_http_error("anthropic", status.as_u16(), &text, model.is_free)
+        );
     }
 
     let mut byte_stream = response.bytes_stream();
@@ -182,8 +198,13 @@ pub async fn stream(
                     "content_block_stop" => {
                         let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                         if let Some(Block::Tool { id, name, arguments }) = blocks.get_mut(index) {
-                            let input = serde_json::from_str::<Value>(arguments)
-                                .unwrap_or_else(|_| json!({ "_raw": arguments }));
+                            let trimmed = arguments.trim();
+                            let input = if trimmed.is_empty() {
+                                json!({})
+                            } else {
+                                serde_json::from_str::<Value>(trimmed)
+                                    .unwrap_or_else(|_| json!({ "_raw": arguments }))
+                            };
                             let event = ProviderEvent::ToolInputEnded {
                                 id: id.clone(),
                                 name: name.clone(),
@@ -347,12 +368,4 @@ fn push_role(out: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
         }
     }
     out.push(json!({"role": role, "content": blocks}));
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        value.to_string()
-    } else {
-        format!("{}…", &value[..max])
-    }
 }

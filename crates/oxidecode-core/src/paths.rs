@@ -77,6 +77,27 @@ impl Paths {
         self.data.join("oxidecode.db")
     }
 
+    pub fn opencode_database(&self) -> PathBuf {
+        env_path("OPENCODE_DB").unwrap_or_else(|| self.opencode_data.join("opencode.db"))
+    }
+
+    /// Candidate `auth.json` credential files from lowest to highest precedence.
+    pub fn auth_files(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for dir in [
+            &self.opencode_config,
+            &self.opencode_data,
+            &self.config,
+            &self.data,
+        ] {
+            let candidate = dir.join("auth.json");
+            if candidate.is_file() {
+                out.push(candidate);
+            }
+        }
+        out
+    }
+
     pub fn service_file(&self) -> PathBuf {
         self.config.join("service.json")
     }

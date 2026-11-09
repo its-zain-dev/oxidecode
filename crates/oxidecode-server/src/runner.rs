@@ -61,9 +61,16 @@ pub async fn run(state: AppState, session_id: &str) -> Result<()> {
     let directory = PathBuf::from(&session.location.directory);
     let config = state.config_for(&directory);
 
+    let session_had_stale_mock = session
+        .model
+        .as_ref()
+        .map(|m| m.provider_id == "mock" && !catalog::is_mock_enabled())
+        .unwrap_or(false);
+
     let model_ref = session
         .model
         .clone()
+        .filter(|m| m.provider_id != "mock" || catalog::is_mock_enabled())
         .or_else(|| {
             config
                 .config
@@ -88,12 +95,12 @@ pub async fn run(state: AppState, session_id: &str) -> Result<()> {
         fail_without_model(&state, &session, &config).await;
         return Ok(());
     };
-    if session.model.is_none() {
+    if session.model.is_none() || session_had_stale_mock {
         session.model = Some(model_ref.clone());
         store.update_session(&session)?;
     }
 
-    let Some(resolved) = catalog::resolve(&config, &model_ref) else {
+    let Some(mut resolved) = catalog::resolve(&config, &model_ref) else {
         let error = StructuredError::new(
             "ModelNotFoundError",
             format!(
@@ -104,6 +111,17 @@ pub async fn run(state: AppState, session_id: &str) -> Result<()> {
         finish_failure(&state, &mut session, error.clone()).await;
         return Ok(());
     };
+
+    if (resolved.provider_id == "opencode"
+        || resolved.provider_id == "opencode-zen"
+        || resolved.provider_id == "opencode-go"
+        || resolved.base_url.contains("opencode.ai"))
+        && !resolved.headers.contains_key("x-opencode-session")
+    {
+        resolved
+            .headers
+            .insert("x-opencode-session".to_string(), session_id.to_string());
+    }
 
     let abort = state.register_runtime(session_id, "");
     let policy = crate::permission::policy_for(&state, &session, &config, abort.clone());

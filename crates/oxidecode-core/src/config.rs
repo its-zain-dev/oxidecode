@@ -1,6 +1,7 @@
 use crate::jsonc;
 use crate::paths::Paths;
 use crate::util::expand_vars;
+use rusqlite::OpenFlags;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -77,6 +78,8 @@ impl ProviderConfig {
             .api_key
             .as_deref()
             .or(self.options.api_key.as_deref())
+            .or_else(|| self.extra.get("apiKey").and_then(Value::as_str))
+            .or_else(|| self.extra.get("api_key").and_then(Value::as_str))
             .filter(|value| !value.is_empty())
     }
 
@@ -85,6 +88,9 @@ impl ProviderConfig {
             .base_url
             .as_deref()
             .or(self.options.base_url.as_deref())
+            .or_else(|| self.extra.get("baseURL").and_then(Value::as_str))
+            .or_else(|| self.extra.get("base_url").and_then(Value::as_str))
+            .or_else(|| self.extra.get("api").and_then(Value::as_str))
             .filter(|value| !value.is_empty())
     }
 
@@ -100,9 +106,9 @@ impl ProviderConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderSettings {
-    #[serde(rename = "apiKey")]
+    #[serde(rename = "apiKey", alias = "api_key")]
     pub api_key: Option<String>,
-    #[serde(rename = "baseURL")]
+    #[serde(rename = "baseURL", alias = "base_url", alias = "api")]
     pub base_url: Option<String>,
     pub headers: BTreeMap<String, String>,
     pub transport: Option<String>,
@@ -204,6 +210,10 @@ pub struct LoadedConfig {
     pub documents: Vec<ConfigDocument>,
     /// Directory the configuration was resolved for (the project root / cwd).
     pub directory: PathBuf,
+    /// Provider credentials loaded from OpenCode/OxideCode `auth.json` and SQLite stores.
+    pub credentials: BTreeMap<String, String>,
+    /// Environment variables loaded from `.env` files in the project hierarchy.
+    pub dotenv: BTreeMap<String, String>,
 }
 
 /// Candidate configuration files from lowest to highest precedence.
@@ -261,6 +271,212 @@ fn candidate_paths(paths: &Paths, directory: &Path) -> Vec<(String, PathBuf)> {
     candidates
 }
 
+fn load_dotenv(directory: &Path) -> BTreeMap<String, String> {
+    let mut chain: Vec<PathBuf> = Vec::new();
+    let mut current = Some(directory.to_path_buf());
+    while let Some(dir) = current {
+        chain.push(dir.clone());
+        current = dir.parent().map(|parent| parent.to_path_buf());
+    }
+    chain.reverse();
+
+    let mut vars = BTreeMap::new();
+    for dir in chain {
+        let env_file = dir.join(".env");
+        let Ok(raw) = std::fs::read_to_string(&env_file) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let line_body = trimmed.strip_prefix("export ").unwrap_or(trimmed).trim();
+            let Some((key, value)) = line_body.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let mut value = value.trim();
+            if (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
+                || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
+            {
+                value = &value[1..value.len() - 1];
+            }
+            if !value.is_empty() {
+                vars.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    vars
+}
+
+fn extract_secret_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Value::Object(map) => {
+            if let Some(inner) = map.get("value") {
+                if let Some(secret) = extract_secret_from_value(inner) {
+                    return Some(secret);
+                }
+            }
+            for field in ["key", "apiKey", "api_key", "access", "access_token", "token", "secret"] {
+                if let Some(s) = map.get(field).and_then(Value::as_str) {
+                    if !s.trim().is_empty() {
+                        return Some(s.trim().to_string());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn parse_auth_json_value(value: &Value, out: &mut BTreeMap<String, String>) {
+    match value {
+        Value::Object(map) => {
+            // Handle `{ "data": [ Credential.Entry, ... ] }` or `{ "credentials": [...] }`
+            for list_key in ["data", "credentials", "accounts"] {
+                if let Some(Value::Array(items)) = map.get(list_key) {
+                    parse_auth_json_array(items, out);
+                }
+            }
+            for (provider_id, entry) in map {
+                if matches!(provider_id.as_str(), "data" | "credentials" | "accounts" | "$schema") {
+                    continue;
+                }
+                if let Some(secret) = extract_secret_from_value(entry) {
+                    out.insert(provider_id.to_string(), secret);
+                }
+            }
+        }
+        Value::Array(items) => {
+            parse_auth_json_array(items, out);
+        }
+        _ => {}
+    }
+}
+
+fn parse_auth_json_array(items: &[Value], out: &mut BTreeMap<String, String>) {
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let active = obj.get("active").and_then(Value::as_bool).unwrap_or(true);
+        let provider_id = obj
+            .get("integrationID")
+            .or_else(|| obj.get("integration_id"))
+            .or_else(|| obj.get("providerID"))
+            .or_else(|| obj.get("provider_id"))
+            .or_else(|| obj.get("provider"))
+            .or_else(|| obj.get("id"))
+            .and_then(Value::as_str);
+        let Some(provider_id) = provider_id.filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        if !active && out.contains_key(provider_id) {
+            continue;
+        }
+        if let Some(secret) = extract_secret_from_value(item) {
+            out.insert(provider_id.to_string(), secret);
+        }
+    }
+}
+
+fn load_sqlite_credentials(db_path: &Path, out: &mut BTreeMap<String, String>) {
+    if !db_path.is_file() {
+        return;
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(conn) = rusqlite::Connection::open_with_flags(db_path, flags) else {
+        return;
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(250));
+
+    // Check `kv` table (used by OxideCode and some OpenCode stores)
+    if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM kv") {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for row in rows.flatten() {
+                let (key, val) = row;
+                if key == "credentials" || key == "auth" || key == "auth.json" {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&val) {
+                        parse_auth_json_value(&parsed, out);
+                    }
+                } else if let Some(provider) = key.strip_prefix("credential:") {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&val) {
+                        if let Some(secret) = extract_secret_from_value(&parsed) {
+                            out.insert(provider.to_string(), secret);
+                        }
+                    } else if !val.trim().is_empty() {
+                        out.insert(provider.to_string(), val.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Check OpenCode V2 `credential` / `credentials` tables if present
+    for query in [
+        "SELECT integration_id, data_json FROM credential",
+        "SELECT integration_id, value FROM credential",
+        "SELECT integration_id, data_json FROM credentials",
+        "SELECT integration_id, value FROM credentials",
+        "SELECT data_json FROM credential",
+        "SELECT data_json FROM credentials",
+    ] {
+        let Ok(mut stmt) = conn.prepare(query) else {
+            continue;
+        };
+        let col_count = stmt.column_count();
+        if col_count == 2 {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }) {
+                for (provider_id, raw) in rows.flatten() {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+                        if let Some(secret) = extract_secret_from_value(&parsed) {
+                            out.insert(provider_id, secret);
+                        }
+                    } else if !raw.trim().is_empty() {
+                        out.insert(provider_id, raw.trim().to_string());
+                    }
+                }
+            }
+        } else if col_count == 1 {
+            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                for raw in rows.flatten() {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+                        parse_auth_json_value(&parsed, out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn load_credentials(paths: &Paths) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    load_sqlite_credentials(&paths.opencode_database(), &mut out);
+    load_sqlite_credentials(&paths.database(), &mut out);
+
+    for path in paths.auth_files() {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let cleaned = jsonc::strip(&raw);
+        let Ok(value) = serde_json::from_str::<Value>(&cleaned) else {
+            continue;
+        };
+        parse_auth_json_value(&value, &mut out);
+    }
+    out
+}
+
 fn deep_merge(target: &mut Value, source: Value) {
     match (target, source) {
         (Value::Object(target), Value::Object(source)) => {
@@ -303,6 +519,8 @@ impl LoadedConfig {
         let directory = directory
             .canonicalize()
             .unwrap_or_else(|_| directory.to_path_buf());
+        let dotenv = load_dotenv(&directory);
+        let credentials = load_credentials(paths);
         let candidates = candidate_paths(paths, &directory);
         let mut merged = Value::Object(serde_json::Map::new());
         let mut documents = Vec::new();
@@ -338,11 +556,55 @@ impl LoadedConfig {
             config,
             documents,
             directory,
+            credentials,
+            dotenv,
         }
     }
 
     pub fn provider(&self, id: &str) -> Option<&ProviderConfig> {
-        self.config.providers.get(id).or_else(|| self.config.provider.get(id))
+        self.config
+            .providers
+            .get(id)
+            .or_else(|| self.config.provider.get(id))
+            .or_else(|| {
+                if id == "opencode" {
+                    self.config
+                        .providers
+                        .get("opencode-zen")
+                        .or_else(|| self.config.provider.get("opencode-zen"))
+                        .or_else(|| self.config.providers.get("opencode-go"))
+                        .or_else(|| self.config.provider.get("opencode-go"))
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// Returns a stored credential for `id` from `auth.json` or `opencode.db`.
+    pub fn credential(&self, id: &str) -> Option<&str> {
+        self.credentials
+            .get(id)
+            .or_else(|| {
+                if id == "opencode" {
+                    self.credentials
+                        .get("opencode-zen")
+                        .or_else(|| self.credentials.get("opencode-go"))
+                        .or_else(|| self.credentials.get("console"))
+                } else {
+                    None
+                }
+            })
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Looks up an environment variable in the process environment, falling back
+    /// to variables parsed from project `.env` files.
+    pub fn env_var(&self, key: &str) -> Option<String> {
+        std::env::var(key)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| self.dotenv.get(key).cloned().filter(|v| !v.is_empty()))
     }
 
     /// Resolves `<provider>/<model>[#variant]`.
@@ -373,5 +635,19 @@ mod tests {
         assert_eq!(a["a"]["b"], 1);
         assert_eq!(a["a"]["c"], 2);
         assert_eq!(a["list"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parses_auth_json_variants() {
+        let raw = serde_json::json!({
+            "opencode": { "type": "api", "key": "oc_sk_test123" },
+            "anthropic": { "type": "oauth", "access": "ant_oauth_token" },
+            "openai": "sk-direct"
+        });
+        let mut map = BTreeMap::new();
+        parse_auth_json_value(&raw, &mut map);
+        assert_eq!(map.get("opencode").map(String::as_str), Some("oc_sk_test123"));
+        assert_eq!(map.get("anthropic").map(String::as_str), Some("ant_oauth_token"));
+        assert_eq!(map.get("openai").map(String::as_str), Some("sk-direct"));
     }
 }

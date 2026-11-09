@@ -128,6 +128,8 @@ pub struct ResolvedModel {
     pub headers: BTreeMap<String, String>,
     pub protocol: Protocol,
     pub package: String,
+    pub reasoning_field: Option<String>,
+    pub is_free: bool,
 }
 
 impl ResolvedModel {
@@ -147,68 +149,131 @@ fn catalog() -> RawCatalog {
     })
 }
 
-fn catalog_providers() -> Vec<RawProvider> {
-    catalog().providers.into_values().collect()
+pub fn is_mock_enabled() -> bool {
+    std::env::var("OXIDECODE_MOCK")
+        .map(|v| {
+            let trimmed = v.trim();
+            !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}
+
+fn free_models_disabled(config: &LoadedConfig) -> bool {
+    config
+        .env_var("OPENCODE_DISABLE_FREE_MODELS")
+        .map(|v| {
+            let trimmed = v.trim();
+            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+fn is_free_model(provider_id: &str, model: &RawModel) -> bool {
+    if provider_id != "opencode" {
+        return false;
+    }
+    if model.id.ends_with("-free") || model.id == "big-pickle" {
+        return true;
+    }
+    if let Some(cost) = model.cost.as_ref() {
+        let input = cost.get("input").and_then(Value::as_f64).unwrap_or(1.0);
+        let output = cost.get("output").and_then(Value::as_f64).unwrap_or(1.0);
+        if input == 0.0 && output == 0.0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn default_api(provider: &str) -> Option<&'static str> {
     match provider {
         "openai" => Some("https://api.openai.com/v1"),
         "anthropic" => Some("https://api.anthropic.com/v1"),
-        "google" => Some("https://generativelanguage.googleapis.com/v1beta"),
+        "google" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
         "openrouter" => Some("https://openrouter.ai/api/v1"),
         "groq" => Some("https://api.groq.com/openai/v1"),
         "deepseek" => Some("https://api.deepseek.com/v1"),
         "xai" => Some("https://api.x.ai/v1"),
         "mistral" => Some("https://api.mistral.ai/v1"),
-        "opencode" => Some("https://opencode.ai/inference/openai/v1"),
+        "opencode" | "opencode-zen" => Some("https://opencode.ai/inference/openai/v1"),
+        "opencode-go" => Some("https://opencode.ai/inference/go/openai/v1"),
         "ollama" => Some("http://127.0.0.1:11434/v1"),
         "mock" => Some("mock://local"),
         _ => None,
     }
 }
 
-fn env_key(provider: &str, declared: &[String]) -> Option<String> {
+fn env_key(config: &LoadedConfig, provider: &str, declared: &[String]) -> Option<String> {
     for key in declared {
-        if let Ok(value) = std::env::var(key) {
-            if !value.is_empty() {
-                return Some(value);
-            }
+        if let Some(value) = config.env_var(key) {
+            return Some(value);
         }
     }
-    let fallback = match provider {
-        "openai" => "OPENAI_API_KEY",
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "google" => "GEMINI_API_KEY",
-        "openrouter" => "OPENROUTER_API_KEY",
-        "groq" => "GROQ_API_KEY",
-        "deepseek" => "DEEPSEEK_API_KEY",
-        "xai" => "XAI_API_KEY",
-        "mistral" => "MISTRAL_API_KEY",
-        "opencode" => "OPENCODE_API_KEY",
+    let fallbacks: &[&str] = match provider {
+        "openai" => &["OPENAI_API_KEY"],
+        "anthropic" => &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
+        "google" => &[
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_GENERATIVE_AI_API_KEY",
+        ],
+        "openrouter" => &["OPENROUTER_API_KEY"],
+        "groq" => &["GROQ_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        "mistral" => &["MISTRAL_API_KEY"],
+        "opencode" | "opencode-zen" | "opencode-go" => &[
+            "OPENCODE_API_KEY",
+            "OPENCODE_ZEN_API_KEY",
+            "OPENCODE_GO_API_KEY",
+        ],
         _ => return None,
     };
-    std::env::var(fallback)
-        .ok()
-        .filter(|value| !value.is_empty())
+    for key in fallbacks {
+        if let Some(value) = config.env_var(key) {
+            return Some(value);
+        }
+    }
+    None
 }
 
-fn provider_available(config: &LoadedConfig, id: &str, declared_env: &[String]) -> bool {
+fn provider_key(config: &LoadedConfig, id: &str, declared_env: &[String]) -> Option<String> {
+    config
+        .provider(id)
+        .and_then(|provider| provider.api_key().map(str::to_string))
+        .or_else(|| config.credential(id).map(str::to_string))
+        .or_else(|| env_key(config, id, declared_env))
+}
+
+fn provider_has_explicit_credentials(
+    config: &LoadedConfig,
+    id: &str,
+    declared_env: &[String],
+) -> bool {
     if id == "mock" {
-        return std::env::var("OXIDECODE_MOCK").map(|v| v != "0").unwrap_or(false);
+        return false;
     }
     if let Some(provider) = config.provider(id) {
         if provider.api_key().is_some() || provider.base_url().is_some() {
             return true;
         }
     }
+    if config.credential(id).is_some() {
+        return true;
+    }
     if id == "ollama"
-        && (std::env::var("OLLAMA_HOST").ok().filter(|v| !v.is_empty()).is_some()
-            || config.provider(id).is_some())
+        && (config.env_var("OLLAMA_HOST").is_some() || config.provider(id).is_some())
     {
         return true;
     }
-    env_key(id, declared_env).is_some()
+    env_key(config, id, declared_env).is_some()
+}
+
+fn provider_available(config: &LoadedConfig, id: &str, declared_env: &[String]) -> bool {
+    if id == "mock" {
+        return is_mock_enabled();
+    }
+    provider_has_explicit_credentials(config, id, declared_env)
 }
 
 fn base_url(config: &LoadedConfig, id: &str, api: Option<&str>) -> String {
@@ -221,15 +286,13 @@ fn base_url(config: &LoadedConfig, id: &str, api: Option<&str>) -> String {
         return url.trim_end_matches('/').to_string();
     }
     if id == "ollama" {
-        if let Ok(host) = std::env::var("OLLAMA_HOST") {
-            if !host.is_empty() {
-                let host = if host.starts_with("http") {
-                    host
-                } else {
-                    format!("http://{host}")
-                };
-                return format!("{}/v1", host.trim_end_matches('/'));
-            }
+        if let Some(host) = config.env_var("OLLAMA_HOST") {
+            let host = if host.starts_with("http") {
+                host
+            } else {
+                format!("http://{host}")
+            };
+            return format!("{}/v1", host.trim_end_matches('/'));
         }
     }
     default_api(id)
@@ -355,18 +418,23 @@ pub fn models(config: &LoadedConfig) -> Vec<ModelInfo> {
     let catalog = catalog();
     let mut out: Vec<ModelInfo> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let disable_free = free_models_disabled(config);
 
     for (id, provider) in &catalog.providers {
-        let enabled = provider_available(config, id, &provider.env);
-        let api_key = env_key(id, &provider.env)
-            .or_else(|| config.provider(id).and_then(|p| p.api_key().map(str::to_string)));
+        let provider_enabled = provider_available(config, id, &provider.env);
+        let configured_key = provider_key(config, id, &provider.env);
         for model in &provider.models {
             seen.insert((id.clone(), model.id.clone()));
+            let model_free = !disable_free && is_free_model(id, model);
+            let enabled = provider_enabled || model_free;
+            let effective_key = configured_key
+                .as_deref()
+                .or(if model_free { Some("public") } else { None });
             out.push(to_model_info(
                 id,
                 provider.npm.as_deref().unwrap_or("@ai-sdk/openai-compatible"),
                 provider.api.as_deref(),
-                api_key.as_deref(),
+                effective_key,
                 model,
                 enabled,
             ));
@@ -375,10 +443,11 @@ pub fn models(config: &LoadedConfig) -> Vec<ModelInfo> {
 
     // Locally declared providers and models.
     for (id, provider) in config.config.providers.iter().chain(config.config.provider.iter()) {
-        let enabled = provider.api_key().is_some() || provider.base_url().is_some();
-        let api_key = provider.api_key().map(str::to_string).or_else(|| {
-            env_key(id, &[])
-        });
+        let enabled = provider.api_key().is_some()
+            || provider.base_url().is_some()
+            || config.credential(id).is_some()
+            || env_key(config, id, &[]).is_some();
+        let api_key = provider_key(config, id, &[]);
         for (model_id, model) in &provider.models {
             let id_final = model.model_id.clone().unwrap_or_else(|| model_id.clone());
             if !seen.insert((id.clone(), id_final.clone())) {
@@ -403,7 +472,7 @@ pub fn models(config: &LoadedConfig) -> Vec<ModelInfo> {
                     .unwrap_or_else(|| "@ai-sdk/openai-compatible".to_string()),
                 settings: json!({
                     "apiKey": api_key,
-                    "baseURL": provider.base_url(),
+                    "baseURL": provider.base_url().or_else(|| default_api(id)),
                     "provider": id,
                 }),
                 capabilities: json!({
@@ -411,6 +480,7 @@ pub fn models(config: &LoadedConfig) -> Vec<ModelInfo> {
                     "input": {"text": true, "image": model.attachment.unwrap_or(false)},
                     "output": {"text": true},
                     "temperature": model.temperature.unwrap_or(true),
+                    "reasoning": model.reasoning.unwrap_or(false),
                 }),
                 variants: model.variants.clone(),
                 time: json!({"released": 0}),
@@ -431,10 +501,8 @@ pub fn models(config: &LoadedConfig) -> Vec<ModelInfo> {
         }
     }
 
-    // Always provide a mock model so the application is testable offline.
-    let mock_enabled = std::env::var("OXIDECODE_MOCK").map(|v| v != "0").unwrap_or(false)
-        || out.iter().all(|model| !model.enabled);
-    if mock_enabled && seen.insert(("mock".into(), "mock-echo".into())) {
+    // Only expose the mock model when explicitly requested via `OXIDECODE_MOCK=1`.
+    if is_mock_enabled() && seen.insert(("mock".into(), "mock-echo".into())) {
         out.push(ModelInfo {
             id: "mock-echo".into(),
             model_id: "mock-echo".into(),
@@ -476,9 +544,11 @@ pub fn models(config: &LoadedConfig) -> Vec<ModelInfo> {
 
 pub fn providers(config: &LoadedConfig) -> Vec<ProviderInfo> {
     let catalog = catalog();
+    let disable_free = free_models_disabled(config);
     let mut out = Vec::new();
     for (id, provider) in &catalog.providers {
-        let enabled = provider_available(config, id, &provider.env);
+        let has_free = !disable_free && provider.models.iter().any(|m| is_free_model(id, m));
+        let enabled = provider_available(config, id, &provider.env) || has_free;
         out.push(ProviderInfo {
             id: id.clone(),
             integration_id: id.clone(),
@@ -497,11 +567,15 @@ pub fn providers(config: &LoadedConfig) -> Vec<ProviderInfo> {
         if out.iter().any(|info| &info.id == id) {
             continue;
         }
+        let enabled = provider.api_key().is_some()
+            || provider.base_url().is_some()
+            || config.credential(id).is_some()
+            || env_key(config, id, &[]).is_some();
         out.push(ProviderInfo {
             id: id.clone(),
             integration_id: id.clone(),
             name: provider.name.clone().unwrap_or_else(|| id.clone()),
-            activation: if provider.api_key().is_some() || provider.base_url().is_some() {
+            activation: if enabled {
                 "enabled".into()
             } else {
                 "available".into()
@@ -518,7 +592,10 @@ pub fn providers(config: &LoadedConfig) -> Vec<ProviderInfo> {
 
 pub fn default_model(config: &LoadedConfig) -> Option<ModelInfo> {
     let all = models(config);
+
+    // 1. Honor explicit model in opencode.json (`provider/model` or bare `model_id`).
     if let Some(reference) = config.config.model.as_deref() {
+        let reference = reference.trim();
         if let Some((provider, id, _variant)) = config.parse_model(reference) {
             if let Some(model) = all
                 .iter()
@@ -526,56 +603,186 @@ pub fn default_model(config: &LoadedConfig) -> Option<ModelInfo> {
             {
                 return Some(model.clone());
             }
+        } else if !reference.is_empty() {
+            if let Some(model) = all
+                .iter()
+                .find(|model| model.enabled && (model.model_id == reference || model.id == reference))
+                .or_else(|| {
+                    all.iter()
+                        .find(|model| model.model_id == reference || model.id == reference)
+                })
+            {
+                return Some(model.clone());
+            }
         }
     }
+
+    // 2. Prefer providers where the user explicitly configured credentials/keys.
+    let catalog = catalog();
+    let mut explicitly_configured = std::collections::HashSet::new();
+    for (id, provider) in &catalog.providers {
+        if provider_has_explicit_credentials(config, id, &provider.env) {
+            explicitly_configured.insert(id.clone());
+        }
+    }
+    for (id, provider) in config.config.providers.iter().chain(config.config.provider.iter()) {
+        if provider.api_key().is_some()
+            || provider.base_url().is_some()
+            || config.credential(id).is_some()
+            || env_key(config, id, &[]).is_some()
+        {
+            explicitly_configured.insert(id.clone());
+        }
+    }
+
+    if explicitly_configured.contains("opencode") {
+        for preferred in ["deepseek-v4.1-flash-free", "glm-5.3-flash-free"] {
+            if let Some(model) = all
+                .iter()
+                .find(|m| m.provider_id == "opencode" && m.model_id == preferred && m.enabled)
+            {
+                return Some(model.clone());
+            }
+        }
+    }
+
+    if let Some(model) = all
+        .iter()
+        .find(|m| m.enabled && explicitly_configured.contains(&m.provider_id))
+    {
+        return Some(model.clone());
+    }
+
+    // 3. When OXIDECODE_MOCK=1 is explicitly active (e.g. smoke tests), allow mock-echo.
+    if is_mock_enabled() {
+        if let Some(mock) = all
+            .iter()
+            .find(|m| m.provider_id == "mock" && m.model_id == "mock-echo")
+        {
+            return Some(mock.clone());
+        }
+    }
+
+    // 4. Prefer OpenCode free models (`deepseek-v4.1-flash-free`, `glm-5.3-flash-free`, etc.).
+    for preferred in [
+        "deepseek-v4.1-flash-free",
+        "glm-5.3-flash-free",
+        "mimo-v2.6-flash-free",
+        "iceman-free",
+    ] {
+        if let Some(model) = all
+            .iter()
+            .find(|m| m.provider_id == "opencode" && m.model_id == preferred && m.enabled)
+        {
+            return Some(model.clone());
+        }
+    }
+
     all.iter()
-        .find(|model| model.enabled)
+        .find(|model| model.enabled && model.provider_id != "mock")
         .cloned()
-        .or_else(|| all.first().cloned())
 }
 
 pub fn resolve(config: &LoadedConfig, reference: &ModelRef) -> Option<ResolvedModel> {
+    if reference.provider_id == "mock" && !is_mock_enabled() {
+        return None;
+    }
+
     let catalog = catalog();
     let provider = config.provider(&reference.provider_id);
     let raw_provider = catalog.providers.get(&reference.provider_id);
+    let raw_model = raw_provider.and_then(|p| {
+        p.models
+            .iter()
+            .find(|m| m.id == reference.id || m.name.eq_ignore_ascii_case(&reference.id))
+    });
 
-    let protocol = match reference.provider_id.as_str() {
-        "anthropic" => Protocol::Anthropic,
-        "mock" => Protocol::Mock,
-        "google" => Protocol::OpenAi, // Gemini's OpenAI-compatible endpoint
-        _ => Protocol::OpenAi,
+    let resolved_model_id = raw_model
+        .map(|m| m.id.clone())
+        .or_else(|| {
+            provider
+                .and_then(|p| p.models.get(&reference.id))
+                .and_then(|m| m.model_id.clone())
+        })
+        .unwrap_or_else(|| reference.id.clone());
+
+    let package = provider
+        .and_then(|provider| provider.npm.clone())
+        .or_else(|| {
+            raw_model
+                .and_then(|model| model.provider.as_ref())
+                .and_then(|p| p.npm.clone())
+        })
+        .or_else(|| raw_provider.and_then(|provider| provider.npm.clone()))
+        .unwrap_or_else(|| "@ai-sdk/openai-compatible".to_string());
+
+    let protocol = if reference.provider_id == "mock" {
+        Protocol::Mock
+    } else if reference.provider_id == "anthropic" || package.contains("anthropic") {
+        Protocol::Anthropic
+    } else {
+        Protocol::OpenAi
     };
 
-    let api = raw_provider.and_then(|provider| provider.api.as_deref());
+    let model_api = raw_model
+        .and_then(|model| model.provider.as_ref())
+        .and_then(|p| p.api.as_deref())
+        .map(|api| {
+            // OpenCode Console translates Gemini models on its OpenAI-compatible endpoint
+            // when using the OpenAI protocol.
+            if protocol == Protocol::OpenAi && api.contains("opencode.ai/inference/google") {
+                "https://opencode.ai/inference/openai/v1"
+            } else {
+                api
+            }
+        });
+    let api = model_api.or_else(|| raw_provider.and_then(|provider| provider.api.as_deref()));
+
     let base_url = if reference.provider_id == "mock" {
         "mock://local".to_string()
     } else {
         base_url(config, &reference.provider_id, api)
     };
-    let api_key = provider
-        .and_then(|provider| provider.api_key().map(str::to_string))
-        .or_else(|| {
-            raw_provider
-                .map(|provider| provider.env.clone())
-                .and_then(|env| env_key(&reference.provider_id, &env))
+
+    let is_free = raw_model
+        .map(|m| is_free_model(&reference.provider_id, m))
+        .unwrap_or_else(|| {
+            reference.provider_id == "opencode"
+                && (resolved_model_id.ends_with("-free") || resolved_model_id == "big-pickle")
         });
+
+    let declared_env = raw_provider
+        .map(|provider| provider.env.clone())
+        .unwrap_or_default();
+    let api_key = provider_key(config, &reference.provider_id, &declared_env).or_else(|| {
+        if reference.provider_id == "opencode" && is_free && !free_models_disabled(config) {
+            Some("public".to_string())
+        } else {
+            None
+        }
+    });
+
     let headers = provider
         .map(|provider| provider.headers().clone())
         .unwrap_or_default();
-    let package = provider
-        .and_then(|provider| provider.npm.clone())
-        .or_else(|| raw_provider.and_then(|provider| provider.npm.clone()))
-        .unwrap_or_else(|| "@ai-sdk/openai-compatible".to_string());
+
+    let reasoning_field = raw_model
+        .and_then(|model| model.interleaved.as_ref())
+        .and_then(|value| value.get("field"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     Some(ResolvedModel {
         provider_id: reference.provider_id.clone(),
-        model_id: reference.id.clone(),
+        model_id: resolved_model_id,
         variant: reference.variant.clone(),
         base_url,
         api_key,
         headers,
         protocol,
         package,
+        reasoning_field,
+        is_free,
     })
 }
 
@@ -593,4 +800,70 @@ pub fn resolve_by_string(config: &LoadedConfig, value: &str) -> Option<ResolvedM
             variant,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_opencode_free_models_without_mock_fallback() {
+        std::env::remove_var("OXIDECODE_MOCK");
+        let cfg = LoadedConfig::default();
+        let all = models(&cfg);
+        assert!(
+            !all.iter().any(|m| m.provider_id == "mock"),
+            "mock provider must not be injected when OXIDECODE_MOCK is unset"
+        );
+        let deepseek_free = all
+            .iter()
+            .find(|m| m.provider_id == "opencode" && m.model_id == "deepseek-v4.1-flash-free")
+            .expect("deepseek-v4.1-flash-free must exist in catalog");
+        assert!(deepseek_free.enabled);
+
+        let glm_free = all
+            .iter()
+            .find(|m| m.provider_id == "opencode" && m.model_id == "glm-5.3-flash-free")
+            .expect("glm-5.3-flash-free must exist in catalog");
+        assert!(glm_free.enabled);
+
+        let default = default_model(&cfg).expect("default model should resolve");
+        assert_ne!(default.provider_id, "mock");
+        assert_eq!(default.provider_id, "opencode");
+        assert_eq!(default.model_id, "deepseek-v4.1-flash-free");
+
+        let resolved = resolve(
+            &cfg,
+            &ModelRef {
+                provider_id: "opencode".into(),
+                id: "deepseek-v4.1-flash-free".into(),
+                variant: None,
+            },
+        )
+        .expect("should resolve opencode/deepseek-v4.1-flash-free");
+        assert_eq!(resolved.protocol, Protocol::OpenAi);
+        assert_eq!(resolved.base_url, "https://opencode.ai/inference/openai/v1");
+        assert_eq!(resolved.api_key.as_deref(), Some("public"));
+        assert_eq!(resolved.reasoning_field.as_deref(), Some("reasoning_content"));
+        assert!(resolved.is_free);
+    }
+
+    #[test]
+    fn resolves_per_model_anthropic_protocol_in_opencode() {
+        let cfg = LoadedConfig::default();
+        let resolved = resolve(
+            &cfg,
+            &ModelRef {
+                provider_id: "opencode".into(),
+                id: "claude-sonnet-5-5".into(),
+                variant: None,
+            },
+        )
+        .expect("should resolve opencode/claude-sonnet-5-5");
+        assert_eq!(resolved.protocol, Protocol::Anthropic);
+        assert_eq!(
+            resolved.base_url,
+            "https://opencode.ai/inference/anthropic/v1"
+        );
+    }
 }

@@ -39,10 +39,12 @@ opencode pair             # prints a browser pairing URL
 ```
 
 Configure a provider through the usual OpenCode-compatible config
-(`~/.config/opencode/opencode.json`) or environment variables such as
-`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY` and
-`DEEPSEEK_API_KEY`. Without a provider key, a deterministic offline mock model
-is enabled automatically (`mock/mock-echo`).
+(`~/.config/opencode/opencode.json`), saved OpenCode credentials
+(`~/.local/share/opencode/auth.json` or `opencode.db`), or environment variables
+such as `OPENCODE_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`GEMINI_API_KEY`, `OPENROUTER_API_KEY` and `DEEPSEEK_API_KEY`. The deterministic
+offline mock model (`mock/mock-echo`) is only enabled when `OXIDECODE_MOCK=1` is
+explicitly set for offline testing.
 
 ## Build from source
 
