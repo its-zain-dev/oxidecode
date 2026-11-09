@@ -27,8 +27,9 @@ export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_DATA_HOME="$ROOT/data"
 export XDG_STATE_HOME="$ROOT/state"
 export XDG_CACHE_HOME="$ROOT/cache"
+export TMPDIR="$ROOT/tmp"
 export OXIDECODE_MOCK=1
-mkdir -p "$HOME" "$ROOT/project"
+mkdir -p "$HOME" "$ROOT/project" "$TMPDIR"
 printf '[workspace]\nmembers = []\n' > "$ROOT/project/Cargo.toml"
 PROJECT="$ROOT/project"
 
@@ -121,6 +122,16 @@ pass "prompt + echo response"
 BASE="$(api "$URL/api/session/$SESSION/message?limit=5000&order=asc" | json_field 'len(d["data"])')"
 prompt ':tool read {"filePath":"Cargo.toml"}'
 wait_messages "$((BASE + 4))" 'Tool execution finished.' >/dev/null || fail "read tool"
+api "$URL/api/session/$SESSION/message?limit=5000&order=asc" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for message in data["data"]:
+    for part in message.get("content", []):
+        if part.get("type") == "tool" and part.get("name") == "read":
+            if part.get("state", {}).get("status") == "completed":
+                sys.exit(0)
+sys.exit(1)
+' || fail "read tool did not complete"
 pass "tool call (read)"
 
 BASE="$(api "$URL/api/session/$SESSION/message?limit=5000&order=asc" | json_field 'len(d["data"])')"
@@ -135,7 +146,18 @@ done
 api -H 'content-type: application/json' -d '{"decision":"once"}' \
   "$URL/api/session/$SESSION/permission/$PERMISSION/reply" >/dev/null
 pass "permission reply"
-wait_messages "$((BASE + 4))" 'smoke' >/dev/null || fail "bash tool after permission"
+wait_messages "$((BASE + 4))" 'Tool execution finished.' >/dev/null || fail "bash tool after permission"
+api "$URL/api/session/$SESSION/message?limit=5000&order=asc" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for message in data["data"]:
+    for part in message.get("content", []):
+        if part.get("type") == "tool" and part.get("name") == "bash":
+            state = part.get("state", {})
+            if state.get("status") == "completed" and "smoke" in json.dumps(state.get("content", [])):
+                sys.exit(0)
+sys.exit(1)
+' || fail "bash tool did not complete after permission"
 pass "tool call (bash)"
 
 sleep 0.5

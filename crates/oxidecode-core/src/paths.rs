@@ -38,7 +38,15 @@ impl Paths {
             .unwrap_or_else(|| home.join(".cache"))
             .join("oxidecode");
         let tmp = env_path("TMPDIR")
-            .unwrap_or_else(|| PathBuf::from("/data/data/com.termux/files/usr/tmp"))
+            .or_else(|| {
+                let termux = PathBuf::from("/data/data/com.termux/files/usr/tmp");
+                if termux.is_dir() {
+                    Some(termux)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(std::env::temp_dir)
             .join("oxidecode");
         let opencode_config = env_path("XDG_CONFIG_HOME")
             .unwrap_or_else(|| home.join(".config"))
