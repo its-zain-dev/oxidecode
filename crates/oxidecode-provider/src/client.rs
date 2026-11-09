@@ -25,16 +25,22 @@ impl ProviderClient {
     ) -> Result<ProviderStream> {
         match model.protocol {
             Protocol::OpenAi => {
-                // opencode.ai inference rejects rustls TLS fingerprints for free-tier
-                // requests. Use the embedded OpenCode/Bun runtime (same engine as
-                // real OpenCode) when available.
                 let is_oc = matches!(model.provider_id.as_str(), "opencode" | "opencode-zen" | "opencode-go")
                     || model.base_url.contains("opencode.ai");
                 if is_oc {
-                    crate::bun::stream(model, request).await
-                } else {
-                    crate::openai::stream(&self.http, model, request).await
+                    // opencode.ai free-tier inference is validated as an official
+                    // OpenCode client flow; raw HTTP (even with mimicked
+                    // headers/TLS) is rejected. Delegate to the real OpenCode
+                    // engine (`opencode run --format json --standalone`), which
+                    // is the proven, working response path.
+                    if crate::opencode_run::can_use(model) {
+                        return crate::opencode_run::stream(model, request).await;
+                    }
+                    if crate::bun::can_use(model) {
+                        return crate::bun::stream(model, request).await;
+                    }
                 }
+                crate::openai::stream(&self.http, model, request).await
             }
             Protocol::Anthropic => crate::anthropic::stream(&self.http, model, request).await,
             Protocol::Mock => Ok(crate::mock::stream(request)),

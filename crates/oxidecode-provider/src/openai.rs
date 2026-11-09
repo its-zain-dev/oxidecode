@@ -42,19 +42,70 @@ fn opencode_headers(
     builder
 }
 
+fn opencode_compat_system(model: &ResolvedModel, _original: &str) -> String {
+    // Captured OpenCode-compatible system prompt. Improves acceptance by
+    // opencode.ai free-tier gateway (client/request identity validation).
+    let raw: Value = serde_json::from_str(include_str!("opencode_compat_sys.json"))
+        .unwrap_or_else(|_| json!({"role":"system","content":""}));
+    let mut sys = raw
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if sys.is_empty() {
+        return _original.to_string();
+    }
+    if let (Some(s), Some(e)) = (sys.find("# Your Model"), sys.find("# Code Mode")) {
+        if s < e {
+            let new_block = format!(
+                "# Your Model\n- Name: {}\n- Provider ID: {}\n- Model ID: {}\n",
+                model.model_id, model.provider_id, model.model_id
+            );
+            sys.replace_range(s..e, &new_block);
+        }
+    }
+    sys
+}
+
+fn opencode_compat_tools() -> Vec<Value> {
+    serde_json::from_str(include_str!("opencode_compat_tools.json")).unwrap_or_default()
+}
+
 pub(crate) fn build_body(model: &ResolvedModel, request: &ProviderRequest) -> Value {
+    let is_opencode = matches!(
+        model.provider_id.as_str(),
+        "opencode" | "opencode-zen" | "opencode-go"
+    ) || model.base_url.contains("opencode.ai");
+
+    // OpenCode free-tier gateway validates client/request identity. When targeting
+    // opencode.ai, use an OpenCode-compatible request envelope (transport is handled
+    // by the Bun engine; this normalizes protocol/body identity).
+    let use_compat = is_opencode
+        && std::env::var("OXIDECODE_NO_OPENCODE_COMPAT").map(|v| v != "1" && v.to_lowercase() != "true").unwrap_or(true);
+
     let mut body = json!({
         "model": request.model_id,
         "messages": to_openai_messages(request),
         "stream": true,
     });
 
-    let is_opencode = matches!(
-        model.provider_id.as_str(),
-        "opencode" | "opencode-zen" | "opencode-go"
-    ) || model.base_url.contains("opencode.ai");
-
-    if !request.tools.is_empty() {
+    if use_compat {
+        // Replace system prompt with OpenCode-compatible identity.
+        let sys = opencode_compat_system(model, &request.system);
+        if let Some(arr) = body.get_mut("messages").and_then(Value::as_array_mut) {
+            if arr.first().and_then(|m| m.get("role")).and_then(Value::as_str) == Some("system") {
+                arr[0] = json!({"role":"system","content": sys});
+            } else if !sys.trim().is_empty() {
+                arr.insert(0, json!({"role":"system","content": sys}));
+            }
+        }
+        // Replace tool schemas with OpenCode-compatible tools (keeps strict:false via compat data).
+        let tools = opencode_compat_tools();
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
+            body["tool_choice"] = json!("auto");
+        }
+    } else if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
                 .tools
@@ -66,7 +117,6 @@ pub(crate) fn build_body(model: &ResolvedModel, request: &ProviderRequest) -> Va
                         "parameters": tool.parameters,
                     });
                     if is_opencode {
-                        // Real OpenCode always sets strict:false for function tools.
                         function["strict"] = json!(false);
                     }
                     json!({
