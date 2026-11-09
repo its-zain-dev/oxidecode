@@ -12,6 +12,7 @@ use tokio::process::Command;
 const FETCH_SCRIPT: &str = r#"
 const fs = require('fs');
 const req = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+try { fs.writeFileSync('/data/data/com.termux/files/usr/tmp/oxidecode-last-req.json', JSON.stringify({url:req.url,headers:req.headers,body:JSON.parse(req.body)})); } catch {}
 try {
   const res = await fetch(req.url, { method: 'POST', headers: req.headers, body: req.body });
   if (!res.ok) {
