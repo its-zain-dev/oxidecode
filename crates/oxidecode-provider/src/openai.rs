@@ -156,11 +156,11 @@ pub async fn stream(
 }
 
 pub(crate) fn process_sse_stream<S, E>(
-    mut byte_stream: S,
+    byte_stream: S,
     reasoning_fields: Vec<String>,
 ) -> ProviderStream
 where
-    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + Unpin + 'static,
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
     let mut decoder = SseDecoder::default();
@@ -170,6 +170,7 @@ where
     let mut finished = false;
 
     let stream = async_stream::stream! {
+        tokio::pin!(byte_stream);
         while let Some(chunk) = byte_stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
