@@ -34,6 +34,9 @@ jobs:
       - name: Test
         run: cargo test --release --locked --workspace
 
+      - name: Smoke test
+        run: bash scripts/smoke.sh target/release/oxidecode
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -74,11 +77,18 @@ jobs:
           "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
             target/aarch64-linux-android/release/oxidecode || true
 
-      - name: Upload binary
+      - name: Add Termux / OpenCode alias
+        run: |
+          cp target/aarch64-linux-android/release/oxidecode \
+             target/aarch64-linux-android/release/opencode
+
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: oxidecode-termux-aarch64
-          path: target/aarch64-linux-android/release/oxidecode
+          path: |
+            target/aarch64-linux-android/release/oxidecode
+            target/aarch64-linux-android/release/opencode
           if-no-files-found: error
 
   linux-aarch64-musl:
@@ -123,6 +133,7 @@ jobs:
           mkdir -p out
           cp dist/oxidecode-linux-x86_64/oxidecode out/oxidecode-linux-x86_64
           cp dist/oxidecode-termux-aarch64/oxidecode out/oxidecode-termux-aarch64
+          cp dist/oxidecode-termux-aarch64/opencode out/opencode-termux-aarch64
           cp dist/oxidecode-linux-aarch64-musl/oxidecode out/oxidecode-linux-aarch64-musl
           chmod +x out/*
 

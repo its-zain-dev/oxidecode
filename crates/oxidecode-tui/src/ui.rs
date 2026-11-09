@@ -20,7 +20,7 @@ use ratatui::Frame;
 use serde_json::Value;
 use std::path::Path;
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = oxidecode_core::API_VERSION;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SIDEBAR_WIDTH: u16 = 42;

@@ -71,7 +71,7 @@ impl AppState {
                 default_directory,
                 default_agent: "build".to_string(),
                 started: Instant::now(),
-                version: oxidecode_core::VERSION.to_string(),
+                version: oxidecode_core::API_VERSION.to_string(),
                 configs: RwLock::new(HashMap::new()),
                 runtimes: Mutex::new(HashMap::new()),
                 approvals: Mutex::new(HashMap::new()),
