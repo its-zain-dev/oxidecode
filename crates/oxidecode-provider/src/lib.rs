@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod bun;
 pub mod catalog;
 pub mod client;
 pub mod mock;

@@ -45,12 +45,7 @@ fn opencode_headers(
 pub(crate) fn build_body(model: &ResolvedModel, request: &ProviderRequest) -> Value {
     let mut body = json!({
         "model": request.model_id,
-        "messages": to_openai_messages(&request),
-        "stream": true,
-    });
-
-        "model": request.model_id,
-        "messages": to_openai_messages(&request),
+        "messages": to_openai_messages(request),
         "stream": true,
     });
 
@@ -156,7 +151,18 @@ pub async fn stream(
     }
 
     let reasoning_fields = reasoning_field_names(model.reasoning_field.as_deref());
-    let mut byte_stream = response.bytes_stream();
+    let byte_stream = response.bytes_stream().map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+    Ok(process_sse_stream(byte_stream, reasoning_fields))
+}
+
+pub(crate) fn process_sse_stream<S, E>(
+    mut byte_stream: S,
+    reasoning_fields: Vec<String>,
+) -> ProviderStream
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
     let mut decoder = SseDecoder::default();
     let mut partial_tools: BTreeMap<u64, PartialTool> = BTreeMap::new();
     let mut started: BTreeSet<u64> = BTreeSet::new();
@@ -221,7 +227,7 @@ pub async fn stream(
         }
     };
 
-    Ok(Box::pin(stream))
+    Box::pin(stream)
 }
 
 pub(crate) fn reasoning_field_names(custom: Option<&str>) -> Vec<String> {
@@ -237,7 +243,7 @@ pub(crate) fn reasoning_field_names(custom: Option<&str>) -> Vec<String> {
     fields
 }
 
-fn parse_sse_payload(
+pub(crate) fn parse_sse_payload(
     payload: &str,
     reasoning_fields: &[String],
     partial_tools: &mut BTreeMap<u64, PartialTool>,
@@ -446,14 +452,14 @@ fn parse_sse_payload(
     events
 }
 
-struct PartialTool {
-    id: String,
-    name: String,
-    arguments: String,
-    emitted_len: usize,
+pub(crate) struct PartialTool {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
+    pub(crate) emitted_len: usize,
 }
 
-fn finish_tools(
+pub(crate) fn finish_tools(
     partials: &mut BTreeMap<u64, PartialTool>,
     started: &mut BTreeSet<u64>,
     ended: &mut BTreeSet<u64>,
@@ -494,7 +500,7 @@ fn finish_tools(
     events
 }
 
-fn map_finish(reason: &str) -> String {
+pub(crate) fn map_finish(reason: &str) -> String {
     match reason {
         "stop" | "end_turn" => "stop",
         "length" | "max_tokens" => "length",
