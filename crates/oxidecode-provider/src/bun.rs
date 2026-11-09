@@ -65,6 +65,16 @@ pub fn can_use(model: &ResolvedModel) -> bool {
     is_opencode && opencode_bin().is_some()
 }
 
+fn hex_id(seed: u128, nbytes: usize) -> String {
+    let mut x = seed;
+    let mut out = String::with_capacity(nbytes * 2);
+    for _ in 0..nbytes {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        out.push_str(&format!("{:02x}", (x >> 56) as u8));
+    }
+    out
+}
+
 fn build_headers(model: &ResolvedModel) -> BTreeMap<String, String> {
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Accept".into(), "*/*".into());
@@ -90,6 +100,22 @@ fn build_headers(model: &ResolvedModel) -> BTreeMap<String, String> {
         }
     }
     headers.entry("x-opencode-project".into()).or_insert_with(|| "oxidecode".into());
+    // Mimic tracing headers sent by real OpenCode.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0) ^ (std::process::id() as u128);
+    headers.entry("traceparent".into()).or_insert_with(|| {
+        format!("00-{}-{}-01", hex_id(seed, 16), hex_id(seed ^ 0x55, 8))
+    });
+    headers.entry("b3".into()).or_insert_with(|| {
+        format!(
+            "{}-{}-1-{}",
+            hex_id(seed, 16),
+            hex_id(seed ^ 0x55, 8),
+            hex_id(seed ^ 0xaa, 8)
+        )
+    });
     if let Some(key) = &model.api_key {
         if !key.is_empty() && !headers.contains_key("Authorization") && !headers.contains_key("authorization") {
             headers.insert("Authorization".into(), format!("Bearer {key}"));

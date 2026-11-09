@@ -87,6 +87,11 @@ pub(crate) fn build_body(model: &ResolvedModel, request: &ProviderRequest) -> Va
         } else {
             body["max_tokens"] = json!(max_tokens);
         }
+    } else if is_opencode {
+        // Real OpenCode always sends max_completion_tokens for opencode inference.
+        if let Some(limit) = model.output_limit {
+            body["max_completion_tokens"] = json!(limit);
+        }
     }
     let supports_usage = is_opencode
         || [

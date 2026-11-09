@@ -129,6 +129,7 @@ pub struct ResolvedModel {
     pub protocol: Protocol,
     pub package: String,
     pub reasoning_field: Option<String>,
+    pub output_limit: Option<u64>,
     pub is_free: bool,
 }
 
@@ -772,6 +773,8 @@ pub fn resolve(config: &LoadedConfig, reference: &ModelRef) -> Option<ResolvedMo
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    let output_limit = raw_model.and_then(|model| model.limit.as_ref()).and_then(|l| l.output);
+
     Some(ResolvedModel {
         provider_id: reference.provider_id.clone(),
         model_id: resolved_model_id,
@@ -782,6 +785,7 @@ pub fn resolve(config: &LoadedConfig, reference: &ModelRef) -> Option<ResolvedMo
         protocol,
         package,
         reasoning_field,
+        output_limit,
         is_free,
     })
 }
