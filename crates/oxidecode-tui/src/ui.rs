@@ -28,6 +28,9 @@ const CONTENT_WIDTH: u16 = 64;
 
 pub fn draw(frame: &mut Frame, app: &mut App) -> Option<(u16, u16)> {
     let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
     let theme = app.theme.clone();
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.background)),
