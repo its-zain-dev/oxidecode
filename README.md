@@ -71,7 +71,7 @@ version tags.
 | --- | --- |
 | `oxidecode-sys` | Safe wrappers for the C PTY / syscall layer |
 | `oxidecode-core` | IDs, config, auth, paths, SQLite store, session model |
-| `oxidecode-provider` | Model catalog, OpenAI/Anthropic/mock streaming |
+| `oxidecode-provider` | Model catalog and direct native HTTP streaming (OpenAI-compatible, Anthropic, mock) |
 | `oxidecode-tools` | read, write, edit, bash, glob, grep, list, webfetch, todos |
 | `oxidecode-server` | Axum HTTP/SSE API, agent runner, permissions |
 | `oxidecode-tui` | Ratatui interface matching the OpenCode V2 look |
@@ -83,6 +83,9 @@ The server implements the OpenCode V2 routes used by the terminal UI and the
 Android integration, including session creation and lookup, prompts, message
 history, model/provider/agent catalogs, file search, permissions, PTY and the
 event stream. Events are emitted as one compact `data: {...}` line per frame.
+
+Provider traffic is native HTTPS/SSE from the Rust process. There is no Bun,
+Node, helper subprocess or `opencode run` delegation on the inference path.
 
 ## License
 

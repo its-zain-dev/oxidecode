@@ -127,6 +127,7 @@ pub async fn run(context: &ToolContext, input: Input) -> Result<ToolOutput, Tool
     let mut total_bytes: usize = 0;
     let mut timed_out = false;
     let mut aborted = false;
+    let started = std::time::Instant::now();
     let deadline = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
     tokio::pin!(deadline);
 
@@ -158,7 +159,7 @@ pub async fn run(context: &ToolContext, input: Input) -> Result<ToolOutput, Tool
             }
             _ = &mut deadline => {
                 timed_out = true;
-                terminate(pid);
+                terminate(pid).await;
                 let _ = child.wait().await;
                 break None;
             }
@@ -171,7 +172,7 @@ pub async fn run(context: &ToolContext, input: Input) -> Result<ToolOutput, Tool
                 }
             } => {
                 aborted = true;
-                terminate(pid);
+                terminate(pid).await;
                 let _ = child.wait().await;
                 break None;
             }
@@ -196,9 +197,12 @@ pub async fn run(context: &ToolContext, input: Input) -> Result<ToolOutput, Tool
     let relative = context.relative(&workdir);
     let header = format!(
         "{} in {} ({}ms)",
-        input.description.clone().unwrap_or_else(|| input.command.clone()),
+        input
+            .description
+            .clone()
+            .unwrap_or_else(|| input.command.clone()),
         relative,
-        timeout_ms.min(0)
+        started.elapsed().as_millis()
     );
 
     let metadata = json!({
@@ -227,18 +231,20 @@ pub async fn run(context: &ToolContext, input: Input) -> Result<ToolOutput, Tool
         Some(code) => Err(ToolError::failed(format!(
             "Command exited with code {code}.\n{text}"
         ))),
-        None => Err(ToolError::failed(format!("Command was terminated.\n{text}"))),
+        None => Err(ToolError::failed(format!(
+            "Command was terminated.\n{text}"
+        ))),
     }
 }
 
-fn terminate(pid: Option<u32>) {
+async fn terminate(pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {
         unsafe {
             // Negative pid targets the process group created by setsid().
             libc::kill(-(pid as i32), libc::SIGTERM);
         }
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }

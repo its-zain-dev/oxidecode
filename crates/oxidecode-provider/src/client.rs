@@ -2,7 +2,13 @@ use crate::catalog::{Protocol, ResolvedModel};
 use crate::types::{ProviderRequest, ProviderStream};
 use anyhow::Result;
 use bytes::BytesMut;
+use std::time::Duration;
 
+/// One shared HTTP client for every provider request.
+///
+/// The engine is deliberately request/response only: no helper process, no
+/// JavaScript runtime and no temporary request dumps. Connection pooling and a
+/// bounded idle pool keep memory use predictable on mobile devices.
 pub struct ProviderClient {
     http: reqwest::Client,
 }
@@ -10,9 +16,12 @@ pub struct ProviderClient {
 impl ProviderClient {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(20))
-            .timeout(std::time::Duration::from_secs(600))
+            .connect_timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(600))
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(90))
             .tcp_nodelay(true)
+            .user_agent(concat!("oxidecode/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { http }
@@ -24,24 +33,7 @@ impl ProviderClient {
         request: ProviderRequest,
     ) -> Result<ProviderStream> {
         match model.protocol {
-            Protocol::OpenAi => {
-                let is_oc = matches!(model.provider_id.as_str(), "opencode" | "opencode-zen" | "opencode-go")
-                    || model.base_url.contains("opencode.ai");
-                if is_oc {
-                    // opencode.ai free-tier inference is validated as an official
-                    // OpenCode client flow; raw HTTP (even with mimicked
-                    // headers/TLS) is rejected. Delegate to the real OpenCode
-                    // engine (`opencode run --format json --standalone`), which
-                    // is the proven, working response path.
-                    if crate::opencode_run::can_use(model) {
-                        return crate::opencode_run::stream(model, request).await;
-                    }
-                    if crate::bun::can_use(model) {
-                        return crate::bun::stream(model, request).await;
-                    }
-                }
-                crate::openai::stream(&self.http, model, request).await
-            }
+            Protocol::OpenAi => crate::openai::stream(&self.http, model, request).await,
             Protocol::Anthropic => crate::anthropic::stream(&self.http, model, request).await,
             Protocol::Mock => Ok(crate::mock::stream(request)),
         }
@@ -146,14 +138,18 @@ pub fn truncate_utf8(value: &str, max_chars: usize) -> String {
 }
 
 /// Formats an HTTP error body from a provider, preserving status codes and
-/// adding actionable guidance for OpenCode Console `FreeTierError` or quota responses.
+/// adding actionable guidance for quota and authentication responses.
 pub fn format_http_error(provider_label: &str, status: u16, body: &str, is_free: bool) -> String {
     let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
     let error_type = parsed
         .as_ref()
         .and_then(|v| {
             v.get("error")
-                .and_then(|e| e.get("type").or_else(|| e.get("code")).or_else(|| e.get("_tag")))
+                .and_then(|e| {
+                    e.get("type")
+                        .or_else(|| e.get("code"))
+                        .or_else(|| e.get("_tag"))
+                })
                 .or_else(|| v.get("type"))
                 .or_else(|| v.get("_tag"))
         })
@@ -181,13 +177,19 @@ pub fn format_http_error(provider_label: &str, status: u16, body: &str, is_free:
         truncate_utf8(message, 1200)
     };
 
+    if status == 429 {
+        return format!(
+            "{provider_label} returned HTTP 429 ({detail}). The provider is rate limiting requests; wait for the quota window to reset or configure another provider key."
+        );
+    }
+
     if status == 403
         && (error_type == "FreeTierError"
             || detail.contains("FreeTierError")
             || detail.contains("can only be used from within OpenCode"))
     {
         return format!(
-            "{provider_label} returned HTTP 403 ({detail}). Note: OpenCode Console restricts free-tier endpoints from external clients; configure OPENCODE_API_KEY (or ~/.local/share/opencode/auth.json) with an active Console/Go account, or configure another provider key (e.g. DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)."
+            "{provider_label} returned HTTP 403 ({detail}). Configure OPENCODE_API_KEY (or ~/.local/share/opencode/auth.json) with an active account, or configure another provider key (e.g. DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)."
         );
     }
 
@@ -198,4 +200,26 @@ pub fn format_http_error(provider_label: &str, status: u16, body: &str, is_free:
     }
 
     format!("{provider_label} returned HTTP {status}: {detail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_mixed_line_endings() {
+        let mut decoder = SseDecoder::default();
+        let events = decoder.push(b"data: one\r\n\r\ndata: two\n\ndata: three\r\n\n");
+        assert_eq!(events, vec!["one", "two", "three"]);
+        assert!(decoder.finish().is_empty());
+    }
+
+    #[test]
+    fn joins_multiline_data_and_flushes_tail() {
+        let mut decoder = SseDecoder::default();
+        assert_eq!(decoder.push(b"data: a\ndata: b\n\n"), vec!["a\nb"]);
+        let mut tail = SseDecoder::default();
+        tail.push(b"data: last");
+        assert_eq!(tail.finish(), vec!["last"]);
+    }
 }

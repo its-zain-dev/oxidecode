@@ -1,6 +1,8 @@
 use super::context::{ToolContext, ToolError, ToolOutput};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
@@ -13,6 +15,18 @@ pub struct Input {
 }
 
 const MAX_BODY: usize = 5 * 1024 * 1024;
+
+/// Reuses one pooled client instead of rebuilding a TLS stack for every fetch.
+fn client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .user_agent("Mozilla/5.0 (compatible; OxideCode/0.1; +https://opencode.ai)")
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
 
 pub async fn run(context: &ToolContext, input: Input) -> Result<ToolOutput, ToolError> {
     let url = input.url.trim().to_string();
@@ -28,14 +42,13 @@ pub async fn run(context: &ToolContext, input: Input) -> Result<ToolOutput, Tool
         .to_ascii_lowercase();
     let timeout = input.timeout.unwrap_or(30).clamp(1, 120);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout))
-        .user_agent("Mozilla/5.0 (compatible; OxideCode/0.1; +https://opencode.ai)")
-        .build()
-        .map_err(|error| ToolError::failed(error.to_string()))?;
-    let response = client
+    let response = client()
         .get(&url)
-        .header("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8")
+        .timeout(Duration::from_secs(timeout))
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+        )
         .send()
         .await
         .map_err(|error| ToolError::failed(format!("fetch {url}: {error}")))?;
@@ -46,18 +59,24 @@ pub async fn run(context: &ToolContext, input: Input) -> Result<ToolOutput, Tool
             status.as_u16()
         )));
     }
+    if response.content_length().unwrap_or(0) > MAX_BODY as u64 {
+        return Err(ToolError::failed("response is larger than 5 MB"));
+    }
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| ToolError::failed(error.to_string()))?;
-    if bytes.len() > MAX_BODY {
-        return Err(ToolError::failed("response is larger than 5 MB"));
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| ToolError::failed(error.to_string()))?;
+        if bytes.len() + chunk.len() > MAX_BODY {
+            return Err(ToolError::failed("response is larger than 5 MB"));
+        }
+        bytes.extend_from_slice(&chunk);
     }
     let body = String::from_utf8_lossy(&bytes).into_owned();
 
@@ -129,7 +148,8 @@ fn html_to_markdown(url: &str, html: &str) -> String {
         let open = format!("<h{level}");
         let close = format!("</h{level}>");
         while let Some(start) = find_tag(&out, &open) {
-            let Some(content_start) = out[start..].find('>').map(|offset| start + offset + 1) else {
+            let Some(content_start) = out[start..].find('>').map(|offset| start + offset + 1)
+            else {
                 break;
             };
             let Some(end_offset) = out[content_start..].find(&close) else {
@@ -138,7 +158,10 @@ fn html_to_markdown(url: &str, html: &str) -> String {
             let content = strip_tags(&out[content_start..content_start + end_offset]);
             let hashes = "#".repeat(level as usize);
             let replacement = format!("\n\n{hashes} {}\n\n", decode_entities(content.trim()));
-            out.replace_range(start..content_start + end_offset + close.len(), &replacement);
+            out.replace_range(
+                start..content_start + end_offset + close.len(),
+                &replacement,
+            );
         }
     }
     for (from, to) in [

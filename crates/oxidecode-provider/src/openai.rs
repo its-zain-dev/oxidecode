@@ -1,129 +1,29 @@
 use crate::catalog::ResolvedModel;
 use crate::client::{base_headers, format_http_error, SseDecoder};
-use crate::types::{ProviderEvent, ProviderRequest, ProviderStream};
+use crate::types::{ProviderEvent, ProviderRequest, ProviderStream, ToolSpec};
 use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn opencode_headers(
-    mut builder: reqwest::RequestBuilder,
-    model: &crate::catalog::ResolvedModel,
-) -> reqwest::RequestBuilder {
-    let is_opencode = matches!(
-        model.provider_id.as_str(),
-        "opencode" | "opencode-zen" | "opencode-go"
-    ) || model.base_url.contains("opencode.ai");
-    if !is_opencode {
-        return builder;
-    }
-
-    // Mimic real OpenCode CLI request identity.
-    builder = builder
-        .header("Accept", "*/*")
-        .header("User-Agent", "opencode/stable/2.2.6/cli")
-        .header("x-opencode-client", "cli");
-
-    // Real OpenCode sends all session correlation headers; the free gateway
-    // rejects requests missing the full session header set.
-    if let Some(session_id) = model
-        .headers
-        .get("x-opencode-session")
-        .or_else(|| model.headers.get("x-session-id"))
-        .cloned()
-    {
-        builder = builder
-            .header("x-opencode-session", &session_id)
-            .header("x-opencode-session-id", &session_id)
-            .header("x-session-affinity", &session_id)
-            .header("x-session-id", &session_id);
-    }
-
-    builder
-}
-
-fn opencode_compat_system(model: &ResolvedModel, _original: &str) -> String {
-    // Captured OpenCode-compatible system prompt. Improves acceptance by
-    // opencode.ai free-tier gateway (client/request identity validation).
-    let raw: Value = serde_json::from_str(include_str!("opencode_compat_sys.json"))
-        .unwrap_or_else(|_| json!({"role":"system","content":""}));
-    let mut sys = raw
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if sys.is_empty() {
-        return _original.to_string();
-    }
-    if let (Some(s), Some(e)) = (sys.find("# Your Model"), sys.find("# Code Mode")) {
-        if s < e {
-            let new_block = format!(
-                "# Your Model\n- Name: {}\n- Provider ID: {}\n- Model ID: {}\n",
-                model.model_id, model.provider_id, model.model_id
-            );
-            sys.replace_range(s..e, &new_block);
-        }
-    }
-    sys
-}
-
-fn opencode_compat_tools() -> Vec<Value> {
-    serde_json::from_str(include_str!("opencode_compat_tools.json")).unwrap_or_default()
-}
-
+/// OpenAI-compatible chat completions request body.
+///
+/// The body is built from the caller's real system prompt and tool schemas.
+/// There is no captured-prompt or tool-list substitution: the model must see
+/// the same tools the agent will actually execute.
 pub(crate) fn build_body(model: &ResolvedModel, request: &ProviderRequest) -> Value {
-    let is_opencode = matches!(
-        model.provider_id.as_str(),
-        "opencode" | "opencode-zen" | "opencode-go"
-    ) || model.base_url.contains("opencode.ai");
-
-    // OpenCode free-tier gateway validates client/request identity. When targeting
-    // opencode.ai, use an OpenCode-compatible request envelope (transport is handled
-    // by the Bun engine; this normalizes protocol/body identity).
-    let use_compat = is_opencode
-        && std::env::var("OXIDECODE_NO_OPENCODE_COMPAT").map(|v| v != "1" && v.to_lowercase() != "true").unwrap_or(true);
-
     let mut body = json!({
         "model": request.model_id,
         "messages": to_openai_messages(request),
         "stream": true,
     });
 
-    if use_compat {
-        // Replace system prompt with OpenCode-compatible identity.
-        let sys = opencode_compat_system(model, &request.system);
-        if let Some(arr) = body.get_mut("messages").and_then(Value::as_array_mut) {
-            if arr.first().and_then(|m| m.get("role")).and_then(Value::as_str) == Some("system") {
-                arr[0] = json!({"role":"system","content": sys});
-            } else if !sys.trim().is_empty() {
-                arr.insert(0, json!({"role":"system","content": sys}));
-            }
-        }
-        // Replace tool schemas with OpenCode-compatible tools (keeps strict:false via compat data).
-        let tools = opencode_compat_tools();
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools);
-            body["tool_choice"] = json!("auto");
-        }
-    } else if !request.tools.is_empty() {
+    if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
                 .tools
                 .iter()
-                .map(|tool| {
-                    let mut function = json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    });
-                    if is_opencode {
-                        function["strict"] = json!(false);
-                    }
-                    json!({
-                        "type": "function",
-                        "function": function,
-                    })
-                })
+                .map(|tool| tool_json(model, tool))
                 .collect(),
         );
         body["tool_choice"] = json!("auto");
@@ -132,33 +32,60 @@ pub(crate) fn build_body(model: &ResolvedModel, request: &ProviderRequest) -> Va
         body["temperature"] = json!(temperature);
     }
     if let Some(max_tokens) = request.max_tokens {
-        if is_opencode {
-            body["max_completion_tokens"] = json!(max_tokens);
+        // OpenAI's newer models use `max_completion_tokens`; OpenAI-compatible
+        // gateways generally follow the same naming.
+        let field = if uses_completion_tokens(model) {
+            "max_completion_tokens"
         } else {
-            body["max_tokens"] = json!(max_tokens);
-        }
-    } else if is_opencode {
-        // Real OpenCode always sends max_completion_tokens for opencode inference.
-        if let Some(limit) = model.output_limit {
-            body["max_completion_tokens"] = json!(limit);
-        }
+            "max_tokens"
+        };
+        body[field] = json!(max_tokens);
     }
-    let supports_usage = is_opencode
-        || [
-            "openai",
-            "openrouter",
-            "groq",
-            "deepseek",
-            "xai",
-        ]
-        .contains(&model.provider_id.as_str());
-    if supports_usage {
+    if supports_usage(model) {
         body["stream_options"] = json!({"include_usage": true});
     }
     if model.provider_id == "openrouter" {
         body["provider"] = json!({"sort": "throughput"});
     }
     body
+}
+
+fn tool_json(model: &ResolvedModel, tool: &ToolSpec) -> Value {
+    let mut function = json!({
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+    });
+    // Some OpenAI-compatible gateways reject function schemas without an
+    // explicit `strict` flag. Only OpenAI itself is strict-capable here.
+    if model.provider_id == "openai" {
+        function["strict"] = json!(false);
+    }
+    json!({
+        "type": "function",
+        "function": function,
+    })
+}
+
+fn uses_completion_tokens(model: &ResolvedModel) -> bool {
+    matches!(
+        model.provider_id.as_str(),
+        "openai" | "opencode" | "opencode-zen" | "opencode-go"
+    )
+}
+
+fn supports_usage(model: &ResolvedModel) -> bool {
+    matches!(
+        model.provider_id.as_str(),
+        "openai"
+            | "openrouter"
+            | "groq"
+            | "deepseek"
+            | "xai"
+            | "opencode"
+            | "opencode-zen"
+            | "opencode-go"
+    )
 }
 
 pub fn resolve_endpoint_url(base_url: &str) -> String {
@@ -194,7 +121,6 @@ pub async fn stream(
             .header("X-Title", "OxideCode");
     }
     let builder = base_headers(builder, model);
-    let builder = opencode_headers(builder, model);
     let response = builder.send().await?;
     let status = response.status();
     if !status.is_success() {
@@ -206,7 +132,9 @@ pub async fn stream(
     }
 
     let reasoning_fields = reasoning_field_names(model.reasoning_field.as_deref());
-    let byte_stream = response.bytes_stream().map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+    let byte_stream = response
+        .bytes_stream()
+        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
     Ok(process_sse_stream(byte_stream, reasoning_fields))
 }
 
@@ -666,6 +594,67 @@ pub(crate) fn to_openai_messages(request: &ProviderRequest) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Protocol;
+    use oxidecode_core::session::{ChatMessage, ChatPart};
+
+    fn model(provider: &str) -> ResolvedModel {
+        ResolvedModel {
+            provider_id: provider.into(),
+            model_id: "test-model".into(),
+            variant: None,
+            base_url: "https://example.com/v1".into(),
+            api_key: None,
+            headers: Default::default(),
+            protocol: Protocol::OpenAi,
+            package: "@ai-sdk/openai-compatible".into(),
+            reasoning_field: None,
+            output_limit: None,
+            is_free: false,
+        }
+    }
+
+    fn request(tools: Vec<ToolSpec>) -> ProviderRequest {
+        ProviderRequest {
+            provider_id: "openai".into(),
+            model_id: "test-model".into(),
+            variant: None,
+            system: "You are a test agent.".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: vec![ChatPart::Text {
+                    text: "hello".into(),
+                }],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }],
+            tools,
+            temperature: Some(0.2),
+            max_tokens: Some(1234),
+        }
+    }
+
+    #[test]
+    fn sends_the_real_system_prompt_and_tools() {
+        let body = build_body(
+            &model("openai"),
+            &request(vec![ToolSpec {
+                name: "read".into(),
+                description: "Read a file.".into(),
+                parameters: json!({"type": "object"}),
+            }]),
+        );
+        assert_eq!(body["messages"][0]["content"], "You are a test agent.");
+        assert_eq!(body["tools"][0]["function"]["name"], "read");
+        assert_eq!(body["max_completion_tokens"], 1234);
+    }
+
+    #[test]
+    fn omits_tools_when_none_are_available() {
+        let body = build_body(&model("deepseek"), &request(Vec::new()));
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert_eq!(body["max_tokens"], 1234);
+    }
 
     #[test]
     fn preserves_tool_call_id_across_multi_chunk_deltas() {

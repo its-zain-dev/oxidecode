@@ -31,14 +31,23 @@ pub async fn stream(
     request: ProviderRequest,
 ) -> Result<ProviderStream> {
     let url = resolve_endpoint_url(&model.base_url);
+    let max_tokens = request
+        .max_tokens
+        .or_else(|| {
+            model
+                .output_limit
+                .map(|limit| limit.min(u32::MAX as u64) as u32)
+        })
+        .unwrap_or(8192);
     let mut body = json!({
         "model": request.model_id,
-        "max_tokens": request.max_tokens.unwrap_or(8192),
-        "system": request.system,
+        "max_tokens": max_tokens,
         "messages": to_anthropic_messages(&request),
         "stream": true,
     });
-
+    if !request.system.trim().is_empty() {
+        body["system"] = json!(request.system);
+    }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
@@ -66,13 +75,6 @@ pub async fn stream(
     if let Some(key) = &model.api_key {
         if !key.is_empty() {
             builder = builder.header("x-api-key", key);
-            if model.provider_id == "opencode"
-                || model.provider_id == "opencode-zen"
-                || model.provider_id == "opencode-go"
-                || model.base_url.contains("opencode.ai")
-            {
-                builder = builder.bearer_auth(key);
-            }
         }
     }
     let builder = base_headers(builder, model);
@@ -90,6 +92,7 @@ pub async fn stream(
     let mut decoder = SseDecoder::default();
     let mut blocks: Vec<Block> = Vec::new();
     let mut finished = false;
+    let mut usage = TokenUsage::default();
 
     let stream = async_stream::stream! {
         'outer: while let Some(chunk) = byte_stream.next().await {
@@ -108,26 +111,17 @@ pub async fn stream(
                 let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
                 match kind {
                     "message_start" => {
-                        if let Some(usage) = value.get("message").and_then(|m| m.get("usage")) {
-                            let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                            let output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                            let cache_read = usage
+                        if let Some(raw) = value.get("message").and_then(|m| m.get("usage")) {
+                            usage.input = raw.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                            usage.output = raw.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                            usage.cache_read = raw
                                 .get("cache_read_input_tokens")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0);
-                            let cache_write = usage
+                            usage.cache_write = raw
                                 .get("cache_creation_input_tokens")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0);
-                            if input > 0 || output > 0 {
-                                yield Ok(ProviderEvent::Usage {
-                                    input,
-                                    output,
-                                    reasoning: 0,
-                                    cache_read,
-                                    cache_write,
-                                });
-                            }
                         }
                     }
                     "content_block_start" => {
@@ -155,6 +149,11 @@ pub async fn stream(
                         } else if kind == "thinking" {
                             Block::Thinking
                         } else {
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                if !text.is_empty() {
+                                    yield Ok(ProviderEvent::TextDelta(text.to_string()));
+                                }
+                            }
                             Block::Text
                         };
                         if blocks.len() <= index {
@@ -215,16 +214,9 @@ pub async fn stream(
                         }
                     }
                     "message_delta" => {
-                        if let Some(usage) = value.get("usage") {
-                            let output = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                            if output > 0 {
-                                yield Ok(ProviderEvent::Usage {
-                                    input: 0,
-                                    output,
-                                    reasoning: 0,
-                                    cache_read: 0,
-                                    cache_write: 0,
-                                });
+                        if let Some(raw) = value.get("usage") {
+                            if let Some(output) = raw.get("output_tokens").and_then(Value::as_u64) {
+                                usage.output = output;
                             }
                         }
                         if let Some(reason) = value
@@ -234,12 +226,21 @@ pub async fn stream(
                         {
                             if !finished {
                                 finished = true;
+                                let event = usage.event();
+                                if let Some(event) = event {
+                                    yield Ok(event);
+                                }
                                 yield Ok(ProviderEvent::Finish { reason: map_stop(reason) });
                             }
                         }
                     }
                     "message_stop" => {
                         if !finished {
+                            finished = true;
+                            let event = usage.event();
+                            if let Some(event) = event {
+                                yield Ok(event);
+                            }
                             yield Ok(ProviderEvent::Finish { reason: "stop".into() });
                         }
                         break 'outer;
@@ -251,12 +252,25 @@ pub async fn stream(
                             .and_then(Value::as_str)
                             .unwrap_or("anthropic stream error")
                             .to_string();
-                        yield Ok(ProviderEvent::Error { message, status: None });
+                        let status = value
+                            .get("error")
+                            .and_then(|error| error.get("status"))
+                            .and_then(Value::as_u64)
+                            .and_then(|code| u16::try_from(code).ok());
+                        yield Ok(ProviderEvent::Error { message, status });
                         break 'outer;
                     }
                     _ => {}
                 }
             }
+        }
+
+        if !finished {
+            let event = usage.event();
+            if let Some(event) = event {
+                yield Ok(event);
+            }
+            yield Ok(ProviderEvent::Finish { reason: "stop".into() });
         }
     };
 
@@ -267,7 +281,34 @@ pub async fn stream(
 enum Block {
     Text,
     Thinking,
-    Tool { id: String, name: String, arguments: String },
+    Tool {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+}
+
+#[derive(Default)]
+struct TokenUsage {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
+
+impl TokenUsage {
+    fn event(&self) -> Option<ProviderEvent> {
+        if self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0 {
+            return None;
+        }
+        Some(ProviderEvent::Usage {
+            input: self.input,
+            output: self.output,
+            reasoning: 0,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+        })
+    }
 }
 
 fn map_stop(reason: &str) -> String {

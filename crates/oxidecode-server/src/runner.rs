@@ -8,13 +8,12 @@ use oxidecode_core::session::{
     AssistantMessage, AssistantPart, ChatMessage, ChatPart, ChatToolCall, Message, ModelRef,
     SessionInfo, StructuredError, TokenUsage, ToolPart, ToolState,
 };
-use oxidecode_provider::catalog::{self, ResolvedModel};
+use oxidecode_provider::catalog::{self};
 use oxidecode_provider::{ProviderEvent, ProviderRequest};
 use oxidecode_tools::{ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +99,7 @@ pub async fn run(state: AppState, session_id: &str) -> Result<()> {
         store.update_session(&session)?;
     }
 
-    let Some(mut resolved) = catalog::resolve(&config, &model_ref) else {
+    let Some(resolved) = catalog::resolve(&config, &model_ref) else {
         let error = StructuredError::new(
             "ModelNotFoundError",
             format!(
@@ -111,17 +110,6 @@ pub async fn run(state: AppState, session_id: &str) -> Result<()> {
         finish_failure(&state, &mut session, error.clone()).await;
         return Ok(());
     };
-
-    if (resolved.provider_id == "opencode"
-        || resolved.provider_id == "opencode-zen"
-        || resolved.provider_id == "opencode-go"
-        || resolved.base_url.contains("opencode.ai"))
-        && !resolved.headers.contains_key("x-opencode-session")
-    {
-        resolved
-            .headers
-            .insert("x-opencode-session".to_string(), session_id.to_string());
-    }
 
     let abort = state.register_runtime(session_id, "");
     let policy = crate::permission::policy_for(&state, &session, &config, abort.clone());
@@ -356,15 +344,23 @@ pub async fn run(state: AppState, session_id: &str) -> Result<()> {
                     cache_read,
                     cache_write,
                 }) => {
-                    usage = TokenUsage {
-                        input,
-                        output,
-                        reasoning,
-                        cache: oxidecode_core::session::CacheUsage {
-                            read: cache_read,
-                            write: cache_write,
-                        },
-                    };
+                    // Providers may report usage in more than one SSE event.
+                    // Merge non-zero values instead of overwriting the totals.
+                    if input > 0 {
+                        usage.input = input;
+                    }
+                    if output > 0 {
+                        usage.output = output;
+                    }
+                    if reasoning > 0 {
+                        usage.reasoning = reasoning;
+                    }
+                    if cache_read > 0 {
+                        usage.cache.read = cache_read;
+                    }
+                    if cache_write > 0 {
+                        usage.cache.write = cache_write;
+                    }
                 }
                 Ok(ProviderEvent::Finish { reason }) => {
                     finish = reason;
@@ -396,7 +392,10 @@ pub async fn run(state: AppState, session_id: &str) -> Result<()> {
         assistant.time.completed = Some(ids::now_ms());
 
         if outcome == Outcome::Interrupted {
-            assistant.error = Some(StructuredError::new("InterruptedError", "execution interrupted"));
+            assistant.error = Some(StructuredError::new(
+                "InterruptedError",
+                "execution interrupted",
+            ));
             let message = Message::Assistant(assistant.clone());
             let _ = store.update_message(session_id, &message);
             break;
@@ -467,9 +466,11 @@ pub async fn run(state: AppState, session_id: &str) -> Result<()> {
                 outcome = Outcome::Interrupted;
                 break;
             }
-            let Some(index) = assistant.content.iter().position(|part| {
-                matches!(part, AssistantPart::Tool(tool) if tool.id == tool_id)
-            }) else {
+            let Some(index) = assistant
+                .content
+                .iter()
+                .position(|part| matches!(part, AssistantPart::Tool(tool) if tool.id == tool_id))
+            else {
                 continue;
             };
             let (name, input) = match &assistant.content[index] {
@@ -636,10 +637,7 @@ async fn wait_abort(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
-fn tool_part_mut<'a>(
-    assistant: &'a mut AssistantMessage,
-    id: &str,
-) -> Option<&'a mut ToolPart> {
+fn tool_part_mut<'a>(assistant: &'a mut AssistantMessage, id: &str) -> Option<&'a mut ToolPart> {
     assistant.content.iter_mut().find_map(|part| match part {
         AssistantPart::Tool(tool) if tool.id == id => Some(tool),
         _ => None,
@@ -764,7 +762,9 @@ fn build_history(messages: &[Message]) -> Vec<ChatMessage> {
                                 ToolState::Completed { content, .. } => Some(
                                     content
                                         .iter()
-                                        .filter_map(|value| value.get("text").and_then(Value::as_str))
+                                        .filter_map(|value| {
+                                            value.get("text").and_then(Value::as_str)
+                                        })
                                         .collect::<Vec<_>>()
                                         .join("\n"),
                                 ),
@@ -865,10 +865,7 @@ fn files_to_parts(files: &[Value]) -> Option<Vec<ChatPart>> {
 
 fn replace_message(messages: &mut [Message], message: Message) {
     let id = message.id().to_string();
-    if let Some(existing) = messages
-        .iter_mut()
-        .find(|existing| existing.id() == id)
-    {
+    if let Some(existing) = messages.iter_mut().find(|existing| existing.id() == id) {
         *existing = message;
     }
 }
@@ -877,13 +874,7 @@ fn tool_specs(config: &Arc<LoadedConfig>, agent: &str) -> Vec<oxidecode_provider
     let mut definitions = oxidecode_tools::definitions();
     if let Some(agent_config) = config.config.agents.get(agent) {
         if !agent_config.tools.is_empty() {
-            definitions.retain(|tool| {
-                agent_config
-                    .tools
-                    .get(&tool.name)
-                    .copied()
-                    .unwrap_or(true)
-            });
+            definitions.retain(|tool| agent_config.tools.get(&tool.name).copied().unwrap_or(true));
         }
     }
     definitions
@@ -967,11 +958,7 @@ fn append_idle(
     let _ = store.append_message(session_id, &Message::Idle(idle));
 }
 
-async fn fail_without_model(
-    state: &AppState,
-    session: &SessionInfo,
-    config: &Arc<LoadedConfig>,
-) {
+async fn fail_without_model(state: &AppState, session: &SessionInfo, config: &Arc<LoadedConfig>) {
     let error = StructuredError::new(
         "NoModelError",
         "no model is configured. Set `model` in opencode.json or export a provider API key.",
@@ -989,11 +976,7 @@ async fn fail_without_model(
     );
 }
 
-async fn finish_failure(
-    state: &AppState,
-    session: &mut SessionInfo,
-    error: StructuredError,
-) {
+async fn finish_failure(state: &AppState, session: &mut SessionInfo, error: StructuredError) {
     append_idle(state.store(), &session.id, "failed", Some(error.clone()));
     set_outcome(state.store(), session, "failed");
     state.bus().emit_session(
@@ -1001,7 +984,4 @@ async fn finish_failure(
         &session.location.directory,
         json!({ "sessionID": session.id, "error": error }),
     );
-    tokio::time::sleep(Duration::from_millis(0)).await;
 }
-
-fn _unused(_: ResolvedModel) {}

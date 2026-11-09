@@ -1216,7 +1216,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
- "async-trait",
  "bytes",
  "futures-util",
  "oxidecode-core",
@@ -1224,7 +1223,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1263,14 +1261,13 @@ dependencies = [
 name = "oxidecode-tools"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "futures-util",
  "globset",
  "ignore",
  "libc",
  "oxidecode-core",
- "oxidecode-sys",
  "regex",
  "reqwest",
  "serde",
@@ -1278,7 +1275,6 @@ dependencies = [
  "similar",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
