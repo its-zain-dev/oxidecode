@@ -28,7 +28,9 @@ impl ProviderClient {
                 // opencode.ai inference rejects rustls TLS fingerprints for free-tier
                 // requests. Use the embedded OpenCode/Bun runtime (same engine as
                 // real OpenCode) when available.
-                if crate::bun::can_use(model) {
+                let is_oc = matches!(model.provider_id.as_str(), "opencode" | "opencode-zen" | "opencode-go")
+                    || model.base_url.contains("opencode.ai");
+                if is_oc {
                     crate::bun::stream(model, request).await
                 } else {
                     crate::openai::stream(&self.http, model, request).await
