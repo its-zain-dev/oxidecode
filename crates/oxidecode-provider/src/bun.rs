@@ -139,6 +139,10 @@ pub async fn stream(model: &ResolvedModel, request: ProviderRequest) -> Result<P
         "headers": headers,
         "body": body.to_string(),
     });
+    // Debug dump
+    if let Ok(dbg) = serde_json::to_string_pretty(&json!({"url":&url,"headers":&req_json["headers"],"body":&body})) {
+        let _ = std::fs::write("/data/data/com.termux/files/usr/tmp/oxidecode-last-req.json", dbg);
+    }
 
     let tmp = std::env::var("OXIDECODE_TMP")
         .ok()
