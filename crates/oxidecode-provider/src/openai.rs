@@ -6,6 +6,111 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+fn opencode_headers(
+    mut builder: reqwest::RequestBuilder,
+    model: &crate::catalog::ResolvedModel,
+) -> reqwest::RequestBuilder {
+    let is_opencode = matches!(
+        model.provider_id.as_str(),
+        "opencode" | "opencode-zen" | "opencode-go"
+    ) || model.base_url.contains("opencode.ai");
+    if !is_opencode {
+        return builder;
+    }
+
+    // Mimic real OpenCode CLI request identity.
+    builder = builder
+        .header("Accept", "*/*")
+        .header("User-Agent", "opencode/stable/2.2.6/cli")
+        .header("x-opencode-client", "cli");
+
+    // Real OpenCode sends all session correlation headers; the free gateway
+    // rejects requests missing the full session header set.
+    if let Some(session_id) = model
+        .headers
+        .get("x-opencode-session")
+        .or_else(|| model.headers.get("x-session-id"))
+        .cloned()
+    {
+        builder = builder
+            .header("x-opencode-session", &session_id)
+            .header("x-opencode-session-id", &session_id)
+            .header("x-session-affinity", &session_id)
+            .header("x-session-id", &session_id);
+    }
+
+    builder
+}
+
+pub(crate) fn build_body(model: &ResolvedModel, request: &ProviderRequest) -> Value {
+    let mut body = json!({
+        "model": request.model_id,
+        "messages": to_openai_messages(&request),
+        "stream": true,
+    });
+
+        "model": request.model_id,
+        "messages": to_openai_messages(&request),
+        "stream": true,
+    });
+
+    let is_opencode = matches!(
+        model.provider_id.as_str(),
+        "opencode" | "opencode-zen" | "opencode-go"
+    ) || model.base_url.contains("opencode.ai");
+
+    if !request.tools.is_empty() {
+        body["tools"] = Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| {
+                    let mut function = json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    });
+                    if is_opencode {
+                        // Real OpenCode always sets strict:false for function tools.
+                        function["strict"] = json!(false);
+                    }
+                    json!({
+                        "type": "function",
+                        "function": function,
+                    })
+                })
+                .collect(),
+        );
+        body["tool_choice"] = json!("auto");
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        if is_opencode {
+            body["max_completion_tokens"] = json!(max_tokens);
+        } else {
+            body["max_tokens"] = json!(max_tokens);
+        }
+    }
+    let supports_usage = is_opencode
+        || [
+            "openai",
+            "openrouter",
+            "groq",
+            "deepseek",
+            "xai",
+        ]
+        .contains(&model.provider_id.as_str());
+    if supports_usage {
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    if model.provider_id == "openrouter" {
+        body["provider"] = json!({"sort": "throughput"});
+    }
+    body
+}
+
 pub fn resolve_endpoint_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     if base.ends_with("/chat/completions") {
@@ -26,55 +131,7 @@ pub async fn stream(
     request: ProviderRequest,
 ) -> Result<ProviderStream> {
     let url = resolve_endpoint_url(&model.base_url);
-    let mut body = json!({
-        "model": request.model_id,
-        "messages": to_openai_messages(&request),
-        "stream": true,
-    });
-
-    if !request.tools.is_empty() {
-        body["tools"] = Value::Array(
-            request
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                        }
-                    })
-                })
-                .collect(),
-        );
-        body["tool_choice"] = json!("auto");
-    }
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
-    }
-    if let Some(max_tokens) = request.max_tokens {
-        body["max_tokens"] = json!(max_tokens);
-    }
-    let supports_usage = [
-        "openai",
-        "openrouter",
-        "groq",
-        "deepseek",
-        "opencode",
-        "opencode-zen",
-        "opencode-go",
-        "xai",
-    ]
-    .contains(&model.provider_id.as_str());
-    if supports_usage {
-        body["stream_options"] = json!({"include_usage": true});
-    }
-    if model.provider_id == "openrouter" {
-        body["provider"] = json!({"sort": "throughput"});
-    }
-
+    let body = build_body(model, &request);
     let mut builder = http.post(&url).json(&body);
     if let Some(key) = &model.api_key {
         if !key.is_empty() {
@@ -87,6 +144,7 @@ pub async fn stream(
             .header("X-Title", "OxideCode");
     }
     let builder = base_headers(builder, model);
+    let builder = opencode_headers(builder, model);
     let response = builder.send().await?;
     let status = response.status();
     if !status.is_success() {
@@ -166,7 +224,7 @@ pub async fn stream(
     Ok(Box::pin(stream))
 }
 
-fn reasoning_field_names(custom: Option<&str>) -> Vec<String> {
+pub(crate) fn reasoning_field_names(custom: Option<&str>) -> Vec<String> {
     let mut fields = Vec::new();
     if let Some(custom) = custom.filter(|s| !s.is_empty()) {
         fields.push(custom.to_string());
@@ -447,7 +505,7 @@ fn map_finish(reason: &str) -> String {
     .to_string()
 }
 
-fn to_openai_messages(request: &ProviderRequest) -> Vec<Value> {
+pub(crate) fn to_openai_messages(request: &ProviderRequest) -> Vec<Value> {
     let mut out = Vec::new();
     if !request.system.trim().is_empty() {
         out.push(json!({"role": "system", "content": request.system}));
