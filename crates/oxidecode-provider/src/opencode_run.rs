@@ -32,10 +32,10 @@ fn last_user_prompt(request: &ProviderRequest) -> String {
     for msg in request.messages.iter().rev() {
         if msg.role == "user" {
             let mut out = String::new();
-            for part in &msg.parts {
+            for part in &msg.content {
                 if let oxidecode_core::session::ChatPart::Text { text } = part {
-                    if !out.is_empty() { out.push_str("\n"); }
-                    out.push_str(text);
+                    if !out.is_empty() { out.push('\n'); }
+                    out.push_str(text.as_str());
                 }
             }
             if !out.trim().is_empty() { return out; }
