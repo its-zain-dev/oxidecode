@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::sync::{oneshot, watch};
 
+/// Lifetime of a browser login / pairing session (30 days).
+pub const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
 #[derive(Debug, Clone)]
 pub struct PermissionAnswer {
     pub allow: bool,
@@ -45,6 +48,7 @@ struct Inner {
     approvals: Mutex<HashMap<String, oneshot::Sender<PermissionAnswer>>>,
     pending: Mutex<HashMap<String, VecDeque<String>>>,
     pair_tokens: Mutex<HashMap<String, i64>>,
+    session_tokens: Mutex<HashMap<String, i64>>,
     pair_counter: AtomicU64,
     pub hostname: String,
     pub port: AtomicU16,
@@ -77,6 +81,7 @@ impl AppState {
                 approvals: Mutex::new(HashMap::new()),
                 pending: Mutex::new(HashMap::new()),
                 pair_tokens: Mutex::new(HashMap::new()),
+                session_tokens: Mutex::new(HashMap::new()),
                 pair_counter: AtomicU64::new(1),
                 hostname,
                 port: AtomicU16::new(port),
@@ -106,6 +111,43 @@ impl AppState {
 
     pub fn verify(&self, candidate: &str) -> bool {
         auth::secret_eq(candidate, &self.inner.password)
+    }
+
+    /// Accepts either the service password or a browser session token.
+    pub fn authorize(&self, candidate: &str) -> bool {
+        self.verify(candidate) || self.verify_session_token(candidate)
+    }
+
+    /// Creates an opaque token for a browser login or pairing session.
+    pub fn create_session_token(&self) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use rand::RngCore;
+
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let token = URL_SAFE_NO_PAD.encode(bytes);
+        let now = oxidecode_core::ids::now_ms();
+        if let Ok(mut tokens) = self.inner.session_tokens.lock() {
+            tokens.retain(|_, expiry| *expiry > now);
+            tokens.insert(token.clone(), now + SESSION_TTL_MS);
+        }
+        token
+    }
+
+    /// Returns true while a browser session token has not expired.
+    pub fn verify_session_token(&self, token: &str) -> bool {
+        if token.is_empty() {
+            return false;
+        }
+        let now = oxidecode_core::ids::now_ms();
+        match self.inner.session_tokens.lock() {
+            Ok(mut tokens) => {
+                tokens.retain(|_, expiry| *expiry > now);
+                tokens.get(token).map(|expiry| *expiry > now).unwrap_or(false)
+            }
+            Err(_) => false,
+        }
     }
 
     pub fn default_directory(&self) -> PathBuf {

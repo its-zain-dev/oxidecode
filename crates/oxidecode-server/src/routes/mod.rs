@@ -9,17 +9,17 @@ pub mod permission;
 pub mod pty;
 pub mod session;
 pub mod shell;
+pub mod web;
 
 use crate::error::ApiError;
 use crate::state::AppState;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
-use oxidecode_core::auth;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -140,9 +140,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/experimental/generate", post(misc::generate_text))
         .route("/api/form", get(permission::empty_forms));
 
-    // Routes reachable without the service password (the pairing flow is
-    // completed in a browser, so it cannot present an Authorization header).
-    let public = Router::new().route("/auth/connect/{code}", get(misc::connect));
+    // Routes reachable without the service password: the landing page (so the
+    // printed URL opens a sign-in form instead of a raw 401) and the browser
+    // login / pairing flow, which cannot present an Authorization header.
+    let public = Router::new()
+        .route("/", get(web::home))
+        .route("/auth/login", post(web::login))
+        .route("/auth/logout", post(web::logout))
+        .route("/auth/connect/{code}", get(misc::connect))
+        .route("/favicon.ico", get(web::favicon));
 
     protected
         .merge(public)
@@ -150,24 +156,18 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+fn is_public(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/favicon.ico" | "/auth/login" | "/auth/logout"
+    ) || path.starts_with("/auth/connect/")
+}
+
 async fn authorize(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let path = request.uri().path();
-    if path.starts_with("/auth/connect/") {
+    if is_public(request.uri().path()) {
         return next.run(request).await;
     }
-    let header = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    let authorized = header
-        .and_then(auth::basic_password)
-        .or_else(|| {
-            header
-                .and_then(|value| value.strip_prefix("Bearer "))
-                .map(str::to_string)
-        })
-        .map(|password| state.verify(&password))
-        .unwrap_or(false);
+    let authorized = web::authorized(&state, request.headers());
     if authorized {
         next.run(request).await
     } else {

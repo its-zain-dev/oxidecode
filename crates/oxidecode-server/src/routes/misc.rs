@@ -5,8 +5,8 @@ use crate::error::{ApiError, ApiResult};
 use crate::routes::{located, no_content, query_directory, string_param};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::Json;
 use oxidecode_core::ids;
 use oxidecode_core::project as project_util;
@@ -41,31 +41,47 @@ pub async fn pair(State(state): State<AppState>) -> ApiResult<Json<Value>> {
 pub async fn connect(
     State(state): State<AppState>,
     Path(code): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
+    let browser = crate::routes::web::prefers_html(&headers);
     if state.consume_pair_token(&code) {
+        // Pairing succeeds in two flavours: browsers get a cookie and are sent
+        // to the dashboard, while API clients receive the session token that
+        // they can use as a password (Basic or Bearer).
+        let token = state.create_session_token();
+        if browser {
+            let mut response = Redirect::to("/").into_response();
+            if let Ok(value) =
+                HeaderValue::from_str(&crate::routes::web::session_cookie(&token))
+            {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+            return response;
+        }
+        return Json(json!({ "token": token })).into_response();
+    }
+    if browser {
         (
-            StatusCode::OK,
+            StatusCode::NOT_FOUND,
             Html(
                 "<!doctype html><meta charset=\"utf-8\"><title>OxideCode</title>\
                  <body style=\"background:#0a0a0a;color:#eeeeee;font-family:monospace;\
                  display:flex;align-items:center;justify-content:center;height:100vh\">\
                  <div><h1 style=\"color:#fab283\">OxideCode</h1>\
-                 <p>Device paired. You can close this window.</p></div></body>"
+                 <p>This pairing code is invalid or has expired.</p>\
+                 <p><a style=\"color:#8ab4ff\" href=\"/\">Return to the server</a></p>\
+                 </div></body>"
                     .to_string(),
             ),
         )
             .into_response()
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Html(
-                "<!doctype html><meta charset=\"utf-8\"><title>OxideCode</title>\
-                 <body style=\"background:#0a0a0a;color:#eeeeee;font-family:monospace\">\
-                 <p>This pairing code is invalid or has expired.</p></body>"
-                    .to_string(),
-            ),
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "UnauthorizedError",
+            "pairing code is invalid or has expired",
         )
-            .into_response()
+        .into_response()
     }
 }
 
